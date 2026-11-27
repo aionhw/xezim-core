@@ -225,11 +225,7 @@ fn pack_packed_struct_array(
     }
     // Pattern order is left-to-right; `[0:N]` stores the left item at the MSB.
     // Prepend each earlier item so the first pattern item ends on the left.
-    let mut acc = Value::zero(0);
-    for elem in elems.iter().rev() {
-        acc = elem.concat_with(&acc);
-    }
-    Some(acc.resize(width))
+    Some(crate::value::Value::concat_refs(elems.iter()).resize(width))
 }
 
 pub(super) fn hoist_package_struct_params(

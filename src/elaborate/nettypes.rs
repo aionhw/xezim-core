@@ -172,9 +172,15 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
         if elab.unpacked_decl_dims.get(base).map_or(0, |d| d.len()) != rank {
             return None;
         }
-        let dt = elab.var_decl_types.get(base).or_else(|| {
-            declared_type_name(elab, base).and_then(|tn| elab.typedef_types.get(&tn))
-        })?;
+        let dt = elab
+            .interconnect_elem_types
+            .get(&name)
+            .and_then(|(_, _, tn)| tn.as_deref())
+            .and_then(|tn| elab.typedef_types.get(tn))
+            .or_else(|| elab.var_decl_types.get(base))
+            .or_else(|| {
+                declared_type_name(elab, base).and_then(|tn| elab.typedef_types.get(&tn))
+            })?;
         match resolve_typedef_chain(dt, &elab.typedef_types) {
             // A PACKED struct keeps a contiguous bit layout that a
             // whole-value write already fills correctly.
@@ -242,44 +248,64 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
     elab.continuous_assigns = out;
 }
 
-/// §6.6.8: the nettype net an element select names. `a[0]` where `a` is a
-/// nettype ARRAY names the ELEMENT's own resolvable net `a[0]`; the driver
-/// count of that element stays independent of a sibling (`a[1]`). A plain
+/// §6.6.8: the nettype net an element select names. `a[0]` (or `m2d[0][1]`)
+/// where `a`/`m2d` is a nettype ARRAY names the ELEMENT's own resolvable net;
+/// the driver count of that element stays independent of siblings. A plain
 /// identifier returns its own name (an Index/RangeSelect names the base for
 /// non-array selects). None when the expression is not a nettype-net LHS.
 fn net_base_of(elab: &ElaboratedModule, e: &Expression) -> Option<String> {
     if let Some(n) = ident_flat_name(e) {
         return Some(n);
     }
-    match &e.kind {
-        ExprKind::Index {
-            expr: base,
-            index,
-            ..
-        } => {
-            let bn = whole_net_ident_name(base)?;
-            if !elab.arrays.contains_key(&bn) {
-                return None;
-            }
-            let idx = eval_const_expr_val(index, &elab.parameters).to_i64()?;
-            let (lo, hi, _) = elab.arrays[&bn];
-            if idx < lo.min(hi) || idx > lo.max(hi) {
-                return None;
-            }
-            let elem = format!("{bn}[{idx}]");
-            // §5.6.1: an escaped identifier (`\a[0] `) is ONE declared scalar
-            // whose flat name is `a[0]`; array elements live under the base
-            // (§7.4.2) and are NEVER separate `signals` entries. If a signal of
-            // that spelling exists, it is the escaped scalar, a DIFFERENT
-            // object from element `a[idx]` — leave the element to the ordinary
-            // (runtime) path so two different objects stay separate.
-            if elab.signals.contains_key(&elem) {
-                return None;
-            }
-            Some(elem)
-        }
-        _ => None,
+    let mut indices = Vec::new();
+    let mut cur = e;
+    while let ExprKind::Index { expr: base, index } = &cur.kind {
+        indices.push(index.as_ref());
+        cur = base.as_ref();
     }
+    if indices.is_empty() {
+        return None;
+    }
+    indices.reverse();
+    let bn = whole_net_ident_name(cur)?;
+    let mut resolved = Vec::with_capacity(indices.len());
+    for idx_e in indices {
+        resolved.push(eval_const_expr_val(idx_e, &elab.parameters).to_i64()?);
+    }
+    let valid_bounds = match resolved.as_slice() {
+        [i0] => elab
+            .arrays
+            .get(&bn)
+            .is_some_and(|&(lo, hi, _)| *i0 >= lo.min(hi) && *i0 <= lo.max(hi)),
+        [i0, i1] => elab.arrays_2d.get(&bn).is_some_and(|&((lo1, hi1), (lo2, hi2), _)| {
+            *i0 >= lo1.min(hi1) && *i0 <= lo1.max(hi1) && *i1 >= lo2.min(hi2) && *i1 <= lo2.max(hi2)
+        }),
+        _ => elab.arrays_nd.get(&bn).is_some_and(|(dims, _)| {
+            dims.len() == resolved.len()
+                && dims
+                    .iter()
+                    .zip(resolved.iter())
+                    .all(|(&(lo, hi), &idx)| idx >= lo.min(hi) && idx <= lo.max(hi))
+        }),
+    };
+    if !valid_bounds {
+        return None;
+    }
+    let mut elem = bn;
+    for idx in resolved {
+        use std::fmt::Write;
+        let _ = write!(&mut elem, "[{idx}]");
+    }
+    // §5.6.1: an escaped identifier (`\a[0] `) is ONE declared scalar
+    // whose flat name is `a[0]`; array elements live under the base
+    // (§7.4.2) and are NEVER separate `signals` entries. If a signal of
+    // that spelling exists, it is the escaped scalar, a DIFFERENT
+    // object from element `a[idx]` — leave the element to the ordinary
+    // (runtime) path so two different objects stay separate.
+    if elab.signals.contains_key(&elem) {
+        return None;
+    }
+    Some(elem)
 }
 
 /// §6.6.7, §10.3.1: the declaration assignment of a user-defined-nettype net
@@ -336,9 +362,9 @@ pub(super) fn nettype_net_delay(
         .then_some((rise, fall, off, exprs))
 }
 
-/// §6.6.8: an emit LHS naming an ARRAY ELEMENT (`a[0]`) must be a real Index
-/// expression — a flat ident literally named `a[0]` does not resolve to the
-/// element's storage.
+/// §6.6.8: an emit LHS naming an ARRAY ELEMENT (`a[0]`, `m2d[0][1]`) must be
+/// a real Index chain — a flat ident literally named `a[0]` does not resolve to
+/// the element's storage.
 pub(super) fn make_net_lhs_expr(name: &str) -> Expression {
     if let Some(open) = name.rfind('[')
         && name.ends_with(']')
@@ -347,13 +373,118 @@ pub(super) fn make_net_lhs_expr(name: &str) -> Expression {
         let base = &name[..open];
         return Expression::new(
             ExprKind::Index {
-                expr: Box::new(make_ident_expr(base)),
+                expr: Box::new(make_net_lhs_expr(base)),
                 index: Box::new(int_literal(idx, Span::dummy())),
             },
             Span::dummy(),
         );
     }
     make_ident_expr(name)
+}
+
+fn make_resolver_call_func(resolver: &str, elab: &ElaboratedModule, span: Span) -> Expression {
+    if elab.functions.contains_key(resolver) || !resolver.contains("::") {
+        return make_ident_expr(resolver);
+    }
+    let Some((scope, method)) = resolver.rsplit_once("::") else {
+        return make_ident_expr(resolver);
+    };
+    if let Some((cls_part, rest)) = scope.split_once('#') {
+        let cls_part = cls_part.trim();
+        let trimmed = rest.trim();
+        let type_args_text = trimmed
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .unwrap_or(trimmed)
+            .to_string();
+        let base_expr = if elab.classes.contains_key(cls_part) {
+            make_ident_expr(cls_part)
+        } else if let Some((pkg, cls)) = cls_part.rsplit_once("::")
+            && elab.packages.contains(pkg)
+        {
+            Expression::new(
+                ExprKind::MemberAccess {
+                    expr: Box::new(make_ident_expr(pkg)),
+                    member: Identifier {
+                        name: cls.to_string(),
+                        span,
+                    },
+                },
+                span,
+            )
+        } else {
+            make_ident_expr(cls_part)
+        };
+        let spec_expr = Expression::new(
+            ExprKind::Specialization {
+                base: Box::new(base_expr),
+                type_args_text,
+            },
+            span,
+        );
+        return Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(spec_expr),
+                member: Identifier {
+                    name: method.to_string(),
+                    span,
+                },
+            },
+            span,
+        );
+    }
+    if elab.classes.contains_key(scope) || elab.typedef_types.contains_key(scope) {
+        return Expression::new(
+            ExprKind::MemberAccess {
+                expr: Box::new(make_ident_expr(scope)),
+                member: Identifier {
+                    name: method.to_string(),
+                    span,
+                },
+            },
+            span,
+        );
+    }
+    if scope.contains("::") {
+        let mut path: Vec<HierPathSegment> = scope
+            .split("::")
+            .map(|seg| HierPathSegment {
+                name: Identifier {
+                    name: seg.to_string(),
+                    span,
+                },
+                selects: Vec::new(),
+            })
+            .collect();
+        path.push(HierPathSegment {
+            name: Identifier {
+                name: method.to_string(),
+                span,
+            },
+            selects: Vec::new(),
+        });
+        return Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path,
+                span,
+                cached_signal_id: crate::ast::cache::SignalCache::new(None),
+                cached_resolved_name: crate::ast::cache::NameCache::new(),
+                bound: Bound::UNSET,
+            }),
+            span,
+        );
+    }
+    Expression::new(
+        ExprKind::MemberAccess {
+            expr: Box::new(make_ident_expr(scope)),
+            member: Identifier {
+                name: method.to_string(),
+                span,
+            },
+        },
+        span,
+    )
 }
 
 /// Qualify unscoped type keys in a resolved-nettype struct driver pattern from
@@ -644,6 +775,23 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     if elab.nettype_resolvers.is_empty() {
         return Ok(());
     }
+    // IEEE 1800-2023 §6.6.7: validate every declared nettype's resolution
+    // function (including unused nettypes). Runs here after
+    // `inline_instantiations` so multi-top `$unit` functions carried by
+    // real top modules are already registered in `elab.functions`.
+    {
+        let mut nt_keys: Vec<&String> = elab.nettype_resolvers.keys().collect();
+        nt_keys.sort();
+        for nt_key in nt_keys {
+            if elab.shadowed_nettypes.contains(nt_key.as_str()) {
+                continue;
+            }
+            let resolver = &elab.nettype_resolvers[nt_key];
+            if !resolver.is_empty() {
+                validate_resolver(elab, nt_key, resolver)?;
+            }
+        }
+    }
 
     // A nettype net that is an UNPACKED ARRAY resolves per element (§6.6.7,
     // §6.6.8): `interconnect realN a[1]; source s(a[0]); load l(a[0]);` — a
@@ -669,6 +817,21 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             }
         }
     }
+    // §6.6.8: heterogeneous `interconnect` array elements record per-element
+    // types (`iBus[1]` -> `realNet`) without polluting sibling elements.
+    if !elab.interconnect_elem_types.is_empty() {
+        let mut elem_entries: Vec<_> = elab.interconnect_elem_types.iter().collect();
+        elem_entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (elem, (_, _, tn_opt)) in elem_entries {
+            if let Some(tn) = tn_opt
+                && let Some(r) = elab.nettype_resolvers.get(tn.as_str())
+                && !r.is_empty()
+                && !hidden(elem, tn)
+            {
+                net_resolver.insert(elem.clone(), r.clone());
+            }
+        }
+    }
     // §6.6.7(d) + §7.2: a nettype over an UNPACKED STRUCT has no signal under
     // its own name inside an instance — the sub-module declaration path
     // registers the member LEAVES and returns, because an unpacked struct is
@@ -686,7 +849,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         if net_resolver.contains_key(name) {
             continue;
         }
-        if let Some(tn) = get_type_name(dt) {
+        if let Some(tn) = declared_user_nettype(elab, dt).or_else(|| get_type_name(dt)) {
             if let Some(r) = elab.nettype_resolvers.get(&tn)
                 && !hidden(name, &tn)
             {
@@ -702,26 +865,83 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
     // §6.6.8: a nettype net that is an UNPACKED ARRAY resolves PER ELEMENT
     // (`interconnect realN a[1]; source s(a0); load l(a1);` — element a[1]
     // must resolve its own drivers, independent of a[0]). Seed each declared
-    // element `a[lo]`..`a[hi]` with the base array's resolver, so an
-    // element-select driver (`assign a[0] = ...`) is folded onto its OWN
-    // element instead of the whole array.
+    // element with the base array's resolver, so an element-select driver
+    // (`assign a[0] = ...`, `assign m2d[0][1] = ...`) folds onto its OWN
+    // element instead of the whole array. Skip heterogeneous `interconnect`
+    // arrays whose per-element types were seeded above.
     // §5.6.1: an escaped identifier (`\a[0] `) is ONE identifier whose name
     // contains the brackets — it lands in `signals` as the flat name `a[0]`,
     // a DIFFERENT object from element 0 of the array `a` (§7.4.2). Do not
     // seed an element key over a declared signal of that spelling: the
     // declared object keeps its own (resolver-less) treatment.
+    let hetero_interconnect_bases: HashSet<String> = elab
+        .interconnect_elem_types
+        .keys()
+        .filter_map(|k| k.split('[').next().map(|s| s.to_string()))
+        .collect();
     let mut elem_resolvers: Vec<(String, String)> = Vec::new();
-    if !elab.arrays.is_empty() {
-        for (base, resolver) in &net_resolver {
-            if let Some(&(lo, hi, _)) = elab.arrays.get(base)
-                && !resolver.is_empty()
-            {
-                for i in lo..=hi {
+    for (base, resolver) in &net_resolver {
+        if resolver.is_empty() {
+            continue;
+        }
+        if hetero_interconnect_bases.contains(base) && elab.interconnect_nets.contains(base) {
+            continue;
+        }
+        if let Some(&(lo, hi, _)) = elab.arrays.get(base) {
+            let (a, b) = (lo.min(hi), lo.max(hi));
+            if a <= b && (b - a) < 4096 {
+                for i in a..=b {
                     let elem = format!("{base}[{i}]");
                     if elab.signals.contains_key(&elem) {
                         continue;
                     }
                     elem_resolvers.push((elem, resolver.clone()));
+                }
+            }
+        }
+        if let Some(&((lo1, hi1), (lo2, hi2), _)) = elab.arrays_2d.get(base) {
+            let (a1, b1) = (lo1.min(hi1), lo1.max(hi1));
+            let (a2, b2) = (lo2.min(hi2), lo2.max(hi2));
+            let total = (b1 - a1 + 1).saturating_mul(b2 - a2 + 1);
+            if a1 <= b1 && a2 <= b2 && total <= 4096 {
+                for i in a1..=b1 {
+                    for j in a2..=b2 {
+                        let elem = format!("{base}[{i}][{j}]");
+                        if elab.signals.contains_key(&elem) {
+                            continue;
+                        }
+                        elem_resolvers.push((elem, resolver.clone()));
+                    }
+                }
+            }
+        }
+        if let Some((dims, _)) = elab.arrays_nd.get(base) {
+            let mut total: i64 = 1;
+            let mut valid = !dims.is_empty();
+            for &(lo, hi) in dims {
+                let (a, b) = (lo.min(hi), lo.max(hi));
+                if a > b {
+                    valid = false;
+                    break;
+                }
+                total = total.saturating_mul(b - a + 1);
+            }
+            if valid && total <= 4096 {
+                let mut paths = vec![base.clone()];
+                for &(lo, hi) in dims {
+                    let (a, b) = (lo.min(hi), lo.max(hi));
+                    let mut next = Vec::with_capacity(paths.len() * (b - a + 1) as usize);
+                    for p in &paths {
+                        for idx in a..=b {
+                            next.push(format!("{p}[{idx}]"));
+                        }
+                    }
+                    paths = next;
+                }
+                for elem in paths {
+                    if !elab.signals.contains_key(&elem) {
+                        elem_resolvers.push((elem, resolver.clone()));
+                    }
                 }
             }
         }
@@ -861,7 +1081,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 .iter()
                 .find_map(|n| elab.arrays.get(n.as_str()).map(|b| (n.as_str(), b)))
         {
-            for i in lo..=hi {
+            for i in lo.min(hi)..=lo.max(hi) {
                 let elem0 = format!("{base0}[{i}]");
                 let Some(&e0) = net_id.get(&elem0) else {
                     continue;
@@ -873,6 +1093,66 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                     let elem = format!("{n}[{i}]");
                     if let Some(&ei) = net_id.get(&elem) {
                         dsu.union(e0, ei);
+                    }
+                }
+            }
+        }
+        if !elab.arrays_2d.is_empty()
+            && let Some((base0, &((lo1, hi1), (lo2, hi2), _))) = group
+                .iter()
+                .find_map(|n| elab.arrays_2d.get(n.as_str()).map(|b| (n.as_str(), b)))
+        {
+            for i in lo1.min(hi1)..=lo1.max(hi1) {
+                for j in lo2.min(hi2)..=lo2.max(hi2) {
+                    let elem0 = format!("{base0}[{i}][{j}]");
+                    let Some(&e0) = net_id.get(&elem0) else {
+                        continue;
+                    };
+                    for n in group {
+                        if n == base0 {
+                            continue;
+                        }
+                        let elem = format!("{n}[{i}][{j}]");
+                        if let Some(&ei) = net_id.get(&elem) {
+                            dsu.union(e0, ei);
+                        }
+                    }
+                }
+            }
+        }
+        if !elab.arrays_nd.is_empty()
+            && let Some((base0, (dims, _))) = group
+                .iter()
+                .find_map(|n| elab.arrays_nd.get(n.as_str()).map(|b| (n.as_str(), b)))
+        {
+            let mut suffixes = vec![String::new()];
+            for &(lo, hi) in dims {
+                let (a, b) = (lo.min(hi), lo.max(hi));
+                let mut next = Vec::new();
+                for s in &suffixes {
+                    for idx in a..=b {
+                        next.push(format!("{s}[{idx}]"));
+                    }
+                }
+                suffixes = next;
+                if suffixes.len() > 4096 {
+                    break;
+                }
+            }
+            if suffixes.len() <= 4096 {
+                for sfx in &suffixes {
+                    let elem0 = format!("{base0}{sfx}");
+                    let Some(&e0) = net_id.get(&elem0) else {
+                        continue;
+                    };
+                    for n in group {
+                        if n == base0 {
+                            continue;
+                        }
+                        let elem = format!("{n}{sfx}");
+                        if let Some(&ei) = net_id.get(&elem) {
+                            dsu.union(e0, ei);
+                        }
                     }
                 }
             }
@@ -1056,7 +1336,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         if dsu_rep[root_id as usize] == idx as u32
             && !net_resolver[name].is_empty()
             && !comp_drivers.contains_key(name)
-            && !elab.arrays.contains_key(name)
+            && !is_unpacked_array_name(elab, name)
             && !clock_driven.contains(&root_id)
         {
             comp_order.push(name.clone());
@@ -1399,7 +1679,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
             }
             Expression::new(
                 ExprKind::Call {
-                    func: Box::new(make_ident_expr(&resolver)),
+                    func: Box::new(make_resolver_call_func(&resolver, elab, span)),
                     args: vec![Expression::new(ExprKind::AssignmentPattern(items), span)],
                 },
                 span,

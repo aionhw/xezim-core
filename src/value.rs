@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 /// A single 4-state logic bit.
 ///
@@ -85,14 +86,439 @@ impl fmt::Display for LogicBit {
 /// interpreter about 0.8 % fewer instructions, so only native-code builds
 /// pay for the fixed offsets.
 #[cfg_attr(feature = "native-layout", repr(C, u8))]
-#[derive(Debug, Clone, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq)]
 enum ValueStorage {
     /// Packed: val_bits holds 0/1, xz_bits marks X/Z.
     /// bit i: val=bit i of val_bits, xz=bit i of xz_bits
     /// 0: val=0,xz=0  1: val=1,xz=0  X: val=0,xz=1  Z: val=1,xz=1
     Inline { val_bits: u64, xz_bits: u64 },
-    /// Fallback for width > 64: two-plane word storage (see `WidePlanes`).
-    Wide(Box<WidePlanes>),
+    /// Two-state wide storage (>64 bits, all X/Z implicitly 0): single heap
+    /// allocation `[0..nwords]` for `val`.
+    Wide2State(Box<[u64]>),
+    /// Four-state wide storage (>64 bits): single heap allocation holding
+    /// `val` in `[0..nwords]` followed by `xz` in `[nwords..2*nwords]`.
+    Wide4State(Box<[u64]>),
+    /// Ref-counted big-endian two-state byte storage (>8 bytes / >64 bits),
+    /// matching SV string layout (`bytes[0]` MSB, `bytes[len - 1]` LSB).
+    /// Enables O(1) clone and zero-copy byte-slice reads across string ops.
+    Bytes(Arc<[u8]>),
+}
+
+impl std::hash::Hash for ValueStorage {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Inline { val_bits, xz_bits } => {
+                0u8.hash(state);
+                val_bits.hash(state);
+                xz_bits.hash(state);
+            }
+            Self::Wide2State(val) => {
+                1u8.hash(state);
+                val.hash(state);
+            }
+            Self::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                let (val, xz) = buf.split_at(n);
+                1u8.hash(state);
+                val.hash(state);
+                if xz.iter().any(|&w| w != 0) {
+                    2u8.hash(state);
+                    xz.hash(state);
+                }
+            }
+            Self::Bytes(bytes) => {
+                1u8.hash(state);
+                let n = Self::wide_nwords((bytes.len() * 8) as u32);
+                let mut stack = [0u64; 32];
+                if n <= stack.len() {
+                    for (wi, slot) in stack[..n].iter_mut().enumerate() {
+                        *slot = Self::bytes_word(bytes, wi);
+                    }
+                    stack[..n].hash(state);
+                } else {
+                    Self::bytes_to_words(bytes, (bytes.len() * 8) as u32).hash(state);
+                }
+            }
+        }
+    }
+}
+
+struct ZeroSeqSer(usize);
+impl Serialize for ZeroSeqSer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0))?;
+        for _ in 0..self.0 {
+            seq.serialize_element(&0u64)?;
+        }
+        seq.end()
+    }
+}
+
+enum ValPlaneSer<'a> {
+    Words(&'a [u64]),
+    Bytes(&'a [u8]),
+}
+impl Serialize for ValPlaneSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::Words(w) => w.serialize(serializer),
+            Self::Bytes(b) => {
+                use serde::ser::SerializeSeq;
+                let n = ValueStorage::wide_nwords((b.len() * 8) as u32);
+                let mut seq = serializer.serialize_seq(Some(n))?;
+                for wi in 0..n {
+                    seq.serialize_element(&ValueStorage::bytes_word(b, wi))?;
+                }
+                seq.end()
+            }
+        }
+    }
+}
+
+enum XzPlaneSer<'a> {
+    Zeros(usize),
+    Words(&'a [u64]),
+}
+impl Serialize for XzPlaneSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            Self::Zeros(n) => ZeroSeqSer(n).serialize(serializer),
+            Self::Words(w) => w.serialize(serializer),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename = "WidePlanes")]
+struct WidePlanesSer<'a> {
+    val: ValPlaneSer<'a>,
+    xz: XzPlaneSer<'a>,
+    nbits: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename = "ValueStorage")]
+enum ValueStorageSer<'a> {
+    Inline { val_bits: u64, xz_bits: u64 },
+    Wide(WidePlanesSer<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename = "Value")]
+struct ValueSer<'a> {
+    storage: ValueStorageSer<'a>,
+    width: u32,
+    is_signed: bool,
+    is_real: bool,
+    is_fill: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "WidePlanes")]
+struct WidePlanesDe {
+    val: Vec<u64>,
+    xz: Vec<u64>,
+    #[allow(dead_code)]
+    nbits: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "ValueStorage")]
+enum ValueStorageDe {
+    Inline { val_bits: u64, xz_bits: u64 },
+    Wide(WidePlanesDe),
+}
+
+impl<'de> Deserialize<'de> for ValueStorage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match ValueStorageDe::deserialize(deserializer)? {
+            ValueStorageDe::Inline { val_bits, xz_bits } => Ok(Self::Inline { val_bits, xz_bits }),
+            ValueStorageDe::Wide(planes) => {
+                if planes.xz.iter().all(|&w| w == 0) {
+                    Ok(Self::Wide2State(planes.val.into_boxed_slice()))
+                } else {
+                    let n = planes.val.len().max(planes.xz.len());
+                    let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                    let vn = planes.val.len().min(n);
+                    let xn = planes.xz.len().min(n);
+                    buf[..vn].copy_from_slice(&planes.val[..vn]);
+                    buf[n..n + xn].copy_from_slice(&planes.xz[..xn]);
+                    Ok(Self::Wide4State(buf))
+                }
+            }
+        }
+    }
+}
+
+impl ValueStorage {
+    #[inline(always)]
+    const fn wide_nwords(nbits: u32) -> usize {
+        let n = (nbits as usize).div_ceil(64);
+        if n == 0 { 1 } else { n }
+    }
+
+    #[inline(always)]
+    fn top_word_mask(nbits: u32) -> u64 {
+        let r = nbits % 64;
+        if r == 0 {
+            u64::MAX
+        } else {
+            (1u64 << r) - 1
+        }
+    }
+
+    #[inline]
+    fn wide_zeroed(width: u32) -> Self {
+        Self::Wide2State(vec![0u64; Self::wide_nwords(width)].into_boxed_slice())
+    }
+
+    #[inline]
+    fn wide_filled(width: u32, bit: LogicBit) -> Self {
+        let n = Self::wide_nwords(width);
+        let top_mask = Self::top_word_mask(width);
+        match bit {
+            LogicBit::Zero => Self::Wide2State(vec![0u64; n].into_boxed_slice()),
+            LogicBit::One => {
+                let mut val = vec![u64::MAX; n].into_boxed_slice();
+                val[n - 1] &= top_mask;
+                Self::Wide2State(val)
+            }
+            LogicBit::X => {
+                let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                buf[n..2 * n].fill(u64::MAX);
+                buf[2 * n - 1] &= top_mask;
+                Self::Wide4State(buf)
+            }
+            LogicBit::Z => {
+                let mut buf = vec![u64::MAX; 2 * n].into_boxed_slice();
+                buf[n - 1] &= top_mask;
+                buf[2 * n - 1] &= top_mask;
+                Self::Wide4State(buf)
+            }
+        }
+    }
+
+    #[inline]
+    fn wide_from_val_words(words: &[u64], width: u32) -> Self {
+        let n = Self::wide_nwords(width);
+        let mut val = vec![0u64; n].into_boxed_slice();
+        let copy_n = words.len().min(n);
+        val[..copy_n].copy_from_slice(&words[..copy_n]);
+        val[n - 1] &= Self::top_word_mask(width);
+        Self::Wide2State(val)
+    }
+
+    #[inline(always)]
+    fn bytes_word(bytes: &[u8], wi: usize) -> u64 {
+        let len = bytes.len();
+        let end = len.saturating_sub(wi * 8);
+        if end == 0 {
+            return 0;
+        }
+        let start = end.saturating_sub(8);
+        let chunk = &bytes[start..end];
+        if chunk.len() == 8 {
+            u64::from_be_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+            ])
+        } else {
+            let mut packed = [0u8; 8];
+            packed[8 - chunk.len()..].copy_from_slice(chunk);
+            u64::from_be_bytes(packed)
+        }
+    }
+
+    #[inline]
+    fn bytes_to_words(bytes: &[u8], width: u32) -> Box<[u64]> {
+        let n = Self::wide_nwords(width);
+        let mut val = vec![0u64; n].into_boxed_slice();
+        for (wi, slot) in val.iter_mut().enumerate() {
+            *slot = Self::bytes_word(bytes, wi);
+        }
+        val[n - 1] &= Self::top_word_mask(width);
+        val
+    }
+
+    #[inline(always)]
+    fn bytes_get_code(bytes: &[u8], i: usize) -> u8 {
+        let byte_idx_from_lsb = i / 8;
+        if byte_idx_from_lsb >= bytes.len() {
+            return 0;
+        }
+        (bytes[bytes.len() - 1 - byte_idx_from_lsb] >> (i % 8)) & 1
+    }
+
+    #[inline(always)]
+    fn bytes_get(bytes: &[u8], i: usize) -> LogicBit {
+        if Self::bytes_get_code(bytes, i) == 1 {
+            LogicBit::One
+        } else {
+            LogicBit::Zero
+        }
+    }
+
+    #[inline(always)]
+    fn bytes_slice64(bytes: &[u8], nbits: u32, pos: usize, n: usize) -> (u64, u64) {
+        let nb = nbits as usize;
+        if n == 0 || pos >= nb {
+            return (0, 0);
+        }
+        let n = n.min(64).min(nb - pos);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let (wi, off) = (pos / 64, pos % 64);
+        let v_lo = Self::bytes_word(bytes, wi) >> off;
+        let v_hi = if off > 0 {
+            Self::bytes_word(bytes, wi + 1) << (64 - off)
+        } else {
+            0
+        };
+        ((v_lo | v_hi) & mask, 0)
+    }
+
+    #[inline]
+    fn materialize_bytes_to_wide2(&mut self, width: u32) {
+        if let Self::Bytes(bytes) = self {
+            *self = Self::Wide2State(Self::bytes_to_words(bytes, width));
+        }
+    }
+
+    #[inline(always)]
+    fn wide_planes(&self) -> Option<(&[u64], &[u64])> {
+        match self {
+            Self::Inline { .. } | Self::Bytes(_) => None,
+            Self::Wide2State(val) => Some((val, &[])),
+            Self::Wide4State(buf) => Some(buf.split_at(buf.len() / 2)),
+        }
+    }
+
+    #[inline(always)]
+    fn wide_planes_mut(&mut self) -> Option<(&mut [u64], Option<&mut [u64]>)> {
+        if let Self::Bytes(bytes) = self {
+            let width = (bytes.len() * 8) as u32;
+            *self = Self::Wide2State(Self::bytes_to_words(bytes, width));
+        }
+        match self {
+            Self::Inline { .. } | Self::Bytes(_) => None,
+            Self::Wide2State(val) => Some((val, None)),
+            Self::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                let (val, xz) = buf.split_at_mut(n);
+                Some((val, Some(xz)))
+            }
+        }
+    }
+
+    #[inline]
+    fn promote_to_4state(&mut self) {
+        match self {
+            Self::Wide2State(val) => {
+                let n = val.len();
+                let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                buf[..n].copy_from_slice(val);
+                *self = Self::Wide4State(buf);
+            }
+            Self::Bytes(bytes) => {
+                let width = (bytes.len() * 8) as u32;
+                let words = Self::bytes_to_words(bytes, width);
+                let n = words.len();
+                let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                buf[..n].copy_from_slice(&words);
+                *self = Self::Wide4State(buf);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline(always)]
+    fn wide_get(val: &[u64], xz: &[u64], i: usize) -> LogicBit {
+        let w = i / 64;
+        let b = i % 64;
+        let v = (val[w] >> b) & 1;
+        let x = xz.get(w).map_or(0, |&xw| (xw >> b) & 1);
+        match (v, x) {
+            (0, 0) => LogicBit::Zero,
+            (1, 0) => LogicBit::One,
+            (0, 1) => LogicBit::X,
+            (_, _) => LogicBit::Z,
+        }
+    }
+
+    #[inline(always)]
+    fn wide_set(&mut self, i: usize, bit: LogicBit) {
+        let w = i / 64;
+        let b = i % 64;
+        let v = (bit as u8 & 1) as u64;
+        let x = ((bit as u8 >> 1) & 1) as u64;
+        if x != 0 && matches!(self, Self::Wide2State(_) | Self::Bytes(_)) {
+            self.promote_to_4state();
+        }
+        if let Some((val, xz)) = self.wide_planes_mut() {
+            val[w] = (val[w] & !(1 << b)) | (v << b);
+            if let Some(xz) = xz {
+                xz[w] = (xz[w] & !(1 << b)) | (x << b);
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn wide_extract64(val: &[u64], xz: &[u64], nbits: u32, pos: usize, n: usize) -> (u64, u64) {
+        let nb = nbits as usize;
+        if n == 0 || pos >= nb {
+            return (0, 0);
+        }
+        let n = n.min(64).min(nb - pos);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let (wi, off) = (pos / 64, pos % 64);
+        let v_lo = val.get(wi).copied().unwrap_or(0) >> off;
+        let v_hi = if off > 0 {
+            val.get(wi + 1).copied().unwrap_or(0) << (64 - off)
+        } else {
+            0
+        };
+        let rv = (v_lo | v_hi) & mask;
+        if xz.is_empty() {
+            return (rv, 0);
+        }
+        let x_lo = xz.get(wi).copied().unwrap_or(0) >> off;
+        let x_hi = if off > 0 {
+            xz.get(wi + 1).copied().unwrap_or(0) << (64 - off)
+        } else {
+            0
+        };
+        (rv, (x_lo | x_hi) & mask)
+    }
+
+    #[inline]
+    fn wide_splice64(&mut self, nbits: u32, pos: usize, v: u64, x: u64, n: usize) {
+        let nb = nbits as usize;
+        if n == 0 || pos >= nb {
+            return;
+        }
+        let n = n.min(64).min(nb - pos);
+        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let (v, x) = (v & mask, x & mask);
+        if x != 0 && matches!(self, Self::Wide2State(_) | Self::Bytes(_)) {
+            self.promote_to_4state();
+        }
+        let (wi, off) = (pos / 64, pos % 64);
+        if let Some((val, mut xz)) = self.wide_planes_mut() {
+            val[wi] = (val[wi] & !(mask << off)) | (v << off);
+            if let Some(xz_slice) = xz.as_deref_mut() {
+                xz_slice[wi] = (xz_slice[wi] & !(mask << off)) | (x << off);
+            }
+            if off + n > 64 {
+                let hi_n = off + n - 64;
+                let hi_mask = (1u64 << hi_n) - 1;
+                let shift = 64 - off;
+                val[wi + 1] = (val[wi + 1] & !hi_mask) | (v >> shift);
+                if let Some(xz_slice) = xz {
+                    xz_slice[wi + 1] = (xz_slice[wi + 1] & !hi_mask) | (x >> shift);
+                }
+            }
+        }
+    }
 }
 
 /// Two-plane word storage for widths > 64: bit `i` of the value lives in
@@ -105,184 +531,7 @@ enum ValueStorage {
 /// copy, and bitwise/compare ops can run word-parallel instead of per-bit.
 /// Per-bit access stays available through `get`/`set`, so every method that
 /// walks bits via `Value::get_bit` keeps working unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WidePlanes {
-    pub val: Vec<u64>,
-    pub xz: Vec<u64>,
-    /// Number of live bits (the owning `Value.width` mirrors this; kept here
-    /// so plane code never reaches back into the `Value`).
-    pub nbits: u32,
-}
 
-impl WidePlanes {
-    #[inline]
-    pub fn nwords(nbits: u32) -> usize {
-        (nbits.max(1) as usize).div_ceil(64)
-    }
-    pub fn zeroed(nbits: u32) -> Self {
-        let n = Self::nwords(nbits);
-        Self {
-            val: vec![0; n],
-            xz: vec![0; n],
-            nbits,
-        }
-    }
-    /// All bits set to `bit`.
-    pub fn filled(nbits: u32, bit: LogicBit) -> Self {
-        let n = Self::nwords(nbits);
-        let (v, x) = match bit {
-            LogicBit::Zero => (0u64, 0u64),
-            LogicBit::One => (u64::MAX, 0),
-            LogicBit::X => (0, u64::MAX),
-            LogicBit::Z => (u64::MAX, u64::MAX),
-        };
-        let mut p = Self {
-            val: vec![v; n],
-            xz: vec![x; n],
-            nbits,
-        };
-        p.mask_top();
-        p
-    }
-    /// Clear any bits at or above `nbits` in the top word.
-    #[inline]
-    pub fn mask_top(&mut self) {
-        let r = (self.nbits % 64) as u64;
-        if r != 0 {
-            let m = (1u64 << r) - 1;
-            if let Some(w) = self.val.last_mut() {
-                *w &= m;
-            }
-            if let Some(w) = self.xz.last_mut() {
-                *w &= m;
-            }
-        }
-    }
-    /// From value words (2-state), LSB word first.
-    pub fn from_val_words(words: &[u64], nbits: u32) -> Self {
-        let n = Self::nwords(nbits);
-        let mut val = vec![0u64; n];
-        for (i, w) in words.iter().take(n).enumerate() {
-            val[i] = *w;
-        }
-        let mut p = Self {
-            val,
-            xz: vec![0; n],
-            nbits,
-        };
-        p.mask_top();
-        p
-    }
-    pub fn from_bits(bits: &[LogicBit]) -> Self {
-        let mut p = Self::zeroed(bits.len() as u32);
-        for (i, b) in bits.iter().enumerate() {
-            p.set(i, *b);
-        }
-        p
-    }
-    #[inline]
-    pub fn get(&self, i: usize) -> LogicBit {
-        if i >= self.nbits as usize {
-            return LogicBit::Zero;
-        }
-        let (w, b) = (i / 64, i % 64);
-        let v = (self.val[w] >> b) & 1;
-        let x = (self.xz[w] >> b) & 1;
-        match (v, x) {
-            (0, 0) => LogicBit::Zero,
-            (1, 0) => LogicBit::One,
-            (0, 1) => LogicBit::X,
-            _ => LogicBit::Z,
-        }
-    }
-    #[inline]
-    pub fn set(&mut self, i: usize, bit: LogicBit) {
-        if i >= self.nbits as usize {
-            return;
-        }
-        let (w, b) = (i / 64, i % 64);
-        let (v, x) = match bit {
-            LogicBit::Zero => (0u64, 0u64),
-            LogicBit::One => (1, 0),
-            LogicBit::X => (0, 1),
-            LogicBit::Z => (1, 1),
-        };
-        self.val[w] = (self.val[w] & !(1 << b)) | (v << b);
-        self.xz[w] = (self.xz[w] & !(1 << b)) | (x << b);
-    }
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.nbits as usize
-    }
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.nbits == 0
-    }
-    #[inline]
-    pub fn any_xz(&self) -> bool {
-        self.xz.iter().any(|&w| w != 0)
-    }
-    /// Splice `n` (≤64) bits of (v, x) planes in at bit position `pos`.
-    #[inline]
-    pub fn splice64(&mut self, pos: usize, v: u64, x: u64, n: usize) {
-        if n == 0 || pos >= self.nbits as usize {
-            return;
-        }
-        let n = n.min(64).min(self.nbits as usize - pos);
-        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
-        let (v, x) = (v & mask, x & mask);
-        let (wi, off) = (pos / 64, pos % 64);
-        self.val[wi] = (self.val[wi] & !(mask << off)) | (v << off);
-        self.xz[wi] = (self.xz[wi] & !(mask << off)) | (x << off);
-        if off + n > 64 {
-            let hi_n = off + n - 64;
-            let hi_mask = (1u64 << hi_n) - 1;
-            self.val[wi + 1] = (self.val[wi + 1] & !hi_mask) | (v >> (64 - off));
-            self.xz[wi + 1] = (self.xz[wi + 1] & !hi_mask) | (x >> (64 - off));
-        }
-    }
-    /// Extract up to 64 bits of both planes starting at `pos`.
-    #[inline]
-    pub fn extract64(&self, pos: usize, n: usize) -> (u64, u64) {
-        let n = n.min(64);
-        let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
-        let (wi, off) = (pos / 64, pos % 64);
-        let take = |plane: &[u64]| -> u64 {
-            let lo = plane.get(wi).copied().unwrap_or(0) >> off;
-            let hi = if off > 0 {
-                plane.get(wi + 1).copied().unwrap_or(0) << (64 - off)
-            } else {
-                0
-            };
-            (lo | hi) & mask
-        };
-        (take(&self.val), take(&self.xz))
-    }
-
-    /// Iterate the live bits, LSB first.
-    pub fn iter_bits(&self) -> impl Iterator<Item = LogicBit> + '_ {
-        (0..self.nbits as usize).map(move |i| self.get(i))
-    }
-    /// Vec-compat alias for `iter_bits` (pre-planes code iterated the
-    /// `Vec<LogicBit>` directly).
-    pub fn iter(&self) -> impl Iterator<Item = LogicBit> + '_ {
-        self.iter_bits()
-    }
-    pub fn contains(&self, b: &LogicBit) -> bool {
-        self.iter_bits().any(|x| x == *b)
-    }
-    /// Vec-compat: `bits.get(i).copied()` shape.
-    pub fn get_opt(&self, i: usize) -> Option<LogicBit> {
-        if i < self.nbits as usize {
-            Some(self.get(i))
-        } else {
-            None
-        }
-    }
-    pub fn to_bit_vec(&self) -> Vec<LogicBit> {
-        self.iter_bits().collect()
-    }
-}
 
 /// Mask selecting bit 0 of every byte of a `u64`.
 #[cfg(test)]
@@ -323,8 +572,30 @@ fn gather_byte_lsbs(lanes: u64) -> u8 {
 #[inline(never)]
 fn storage_eq_slow(a: &ValueStorage, b: &ValueStorage) -> bool {
     match (a, b) {
-        (ValueStorage::Wide(a), ValueStorage::Wide(b)) => a == b,
-        _ => false,
+        (ValueStorage::Bytes(ab), ValueStorage::Bytes(bb)) => Arc::ptr_eq(ab, bb) || ab == bb,
+        (ValueStorage::Bytes(ab), other) | (other, ValueStorage::Bytes(ab)) => {
+            let Some((ov, ox)) = other.wide_planes() else {
+                return false;
+            };
+            let nw = ValueStorage::wide_nwords((ab.len() * 8) as u32);
+            ov.len() == nw
+                && ox.iter().all(|&w| w == 0)
+                && (0..nw).all(|wi| ValueStorage::bytes_word(ab, wi) == ov[wi])
+        }
+        _ => match (a.wide_planes(), b.wide_planes()) {
+            (Some((av, ax)), Some((bv, bx))) => {
+                if av != bv {
+                    return false;
+                }
+                match (ax.is_empty(), bx.is_empty()) {
+                    (true, true) => true,
+                    (false, false) => ax == bx,
+                    (true, false) => bx.iter().all(|&w| w == 0),
+                    (false, true) => ax.iter().all(|&w| w == 0),
+                }
+            }
+            _ => false,
+        },
     }
 }
 
@@ -361,7 +632,7 @@ impl PartialEq for ValueStorage {
 /// is 32 bytes; `Value::INLINE_VAL_OFFSET` / `INLINE_XZ_OFFSET` name the
 /// plane offsets for native readers (`native-layout` feature).
 #[cfg_attr(feature = "native-layout", repr(C))]
-#[derive(Debug, Clone, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, Deserialize)]
 pub struct Value {
     storage: ValueStorage,
     pub width: u32,
@@ -376,6 +647,44 @@ pub struct Value {
     /// never carry it. Serde default keeps older artifacts readable.
     #[serde(default)]
     pub is_fill: bool,
+}
+
+impl Serialize for Value {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let storage = match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => ValueStorageSer::Inline {
+                val_bits: *val_bits,
+                xz_bits: *xz_bits,
+            },
+            ValueStorage::Wide2State(val) => ValueStorageSer::Wide(WidePlanesSer {
+                val: ValPlaneSer::Words(val),
+                xz: XzPlaneSer::Zeros(val.len()),
+                nbits: self.width,
+            }),
+            ValueStorage::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                let (val, xz) = buf.split_at(n);
+                ValueStorageSer::Wide(WidePlanesSer {
+                    val: ValPlaneSer::Words(val),
+                    xz: XzPlaneSer::Words(xz),
+                    nbits: self.width,
+                })
+            }
+            ValueStorage::Bytes(bytes) => ValueStorageSer::Wide(WidePlanesSer {
+                val: ValPlaneSer::Bytes(bytes),
+                xz: XzPlaneSer::Zeros(ValueStorage::wide_nwords(self.width)),
+                nbits: self.width,
+            }),
+        };
+        ValueSer {
+            storage,
+            width: self.width,
+            is_signed: self.is_signed,
+            is_real: self.is_real,
+            is_fill: self.is_fill,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl PartialEq for Value {
@@ -396,7 +705,7 @@ impl PartialEq for Value {
 
 /// Build Wide storage with every bit set to `bit` (top clamped by width).
 fn wide_filled_bits(width: u32, bit: LogicBit) -> ValueStorage {
-    ValueStorage::Wide(Box::new(WidePlanes::filled(width, bit)))
+    ValueStorage::wide_filled(width, bit)
 }
 
 impl Value {
@@ -420,7 +729,16 @@ impl Value {
         let xz = unsafe { std::ptr::read_unaligned(p.add(Self::INLINE_XZ_OFFSET) as *const u64) };
         let w = Value::new(100);
         let wtag = unsafe { *(&w as *const Value as *const u8) };
-        tag == 0 && val == 0x1234_5678_9abc_def0 && xz == 0x0f0f_0f0f_f0f0_f0f0 && wtag != 0
+        let w2 = Value::zero(100);
+        let w2tag = unsafe { *(&w2 as *const Value as *const u8) };
+        let b = Value::from_bytes(&[b'A'; 16]);
+        let btag = unsafe { *(&b as *const Value as *const u8) };
+        tag == 0
+            && val == 0x1234_5678_9abc_def0
+            && xz == 0x0f0f_0f0f_f0f0_f0f0
+            && wtag != 0
+            && w2tag != 0
+            && btag != 0
     }
 }
 
@@ -706,7 +1024,7 @@ impl Value {
             }
         } else {
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::filled(width, LogicBit::X))),
+                storage: ValueStorage::wide_filled(width, LogicBit::X),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -731,7 +1049,7 @@ impl Value {
             }
         } else {
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::filled(width, LogicBit::Zero))),
+                storage: ValueStorage::wide_zeroed(width),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -756,14 +1074,8 @@ impl Value {
                 is_fill: false,
             }
         } else {
-            let mut bits = vec![LogicBit::Zero; width as usize];
-            for i in 0..64.min(width as usize) {
-                if (val >> i) & 1 == 1 {
-                    bits[i] = LogicBit::One;
-                }
-            }
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::from_bits(&bits))),
+                storage: ValueStorage::wide_from_val_words(&[val], width),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -790,15 +1102,11 @@ impl Value {
                 is_fill: false,
             }
         } else {
-            let mut bits = vec![LogicBit::Zero; width as usize];
-            let lim = 128.min(width as usize);
-            for i in 0..lim {
-                if (val >> i) & 1 == 1 {
-                    bits[i] = LogicBit::One;
-                }
-            }
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::from_bits(&bits))),
+                storage: ValueStorage::wide_from_val_words(
+                    &[val as u64, (val >> 64) as u64],
+                    width,
+                ),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -812,11 +1120,20 @@ impl Value {
     pub fn to_u128(&self) -> u128 {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits & !*xz_bits) as u128,
-            ValueStorage::Wide(bits) => {
-                let w0 =
-                    bits.val.first().copied().unwrap_or(0) & !bits.xz.first().copied().unwrap_or(0);
-                let w1 =
-                    bits.val.get(1).copied().unwrap_or(0) & !bits.xz.get(1).copied().unwrap_or(0);
+            ValueStorage::Wide2State(val) => {
+                let w0 = val.first().copied().unwrap_or(0);
+                let w1 = val.get(1).copied().unwrap_or(0);
+                (w0 as u128) | ((w1 as u128) << 64)
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                let w0 = val.first().copied().unwrap_or(0) & !xz.first().copied().unwrap_or(0);
+                let w1 = val.get(1).copied().unwrap_or(0) & !xz.get(1).copied().unwrap_or(0);
+                (w0 as u128) | ((w1 as u128) << 64)
+            }
+            ValueStorage::Bytes(bytes) => {
+                let w0 = ValueStorage::bytes_word(bytes, 0);
+                let w1 = ValueStorage::bytes_word(bytes, 1);
                 (w0 as u128) | ((w1 as u128) << 64)
             }
         }
@@ -861,6 +1178,13 @@ impl Value {
             latin1 = s.chars().map(|c| (c as u32) as u8).collect();
             &latin1
         };
+        Self::from_bytes(bytes)
+    }
+
+    /// Construct a packed SystemVerilog string `Value` directly from raw
+    /// bytes (big-endian, MSB = byte 0). An empty slice returns `Value::zero(0)`
+    /// with zero heap allocations.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
         let width = (bytes.len() * 8) as u32;
         if width <= 64 {
             let mut val_bits = 0u64;
@@ -879,21 +1203,26 @@ impl Value {
             }
         } else {
             // §6.16: the rightmost byte occupies the least-significant bits.
-            // Build the value plane directly without a temporary bit vector.
-            let mut planes = WidePlanes::zeroed(width);
-            for (word, chunk) in planes.val.iter_mut().zip(bytes.rchunks(8)) {
-                let mut packed = [0u8; 8];
-                packed[8 - chunk.len()..].copy_from_slice(chunk);
-                *word = u64::from_be_bytes(packed);
-            }
+            // Retain the big-endian byte slice under `Arc<[u8]>` for O(1)
+            // clones and zero-copy byte reads in string operations.
             Self {
-                storage: ValueStorage::Wide(Box::new(planes)),
+                storage: ValueStorage::Bytes(Arc::from(bytes)),
                 width,
                 is_signed: false,
                 is_real: false,
                 is_fill: false,
             }
         }
+    }
+
+    /// Construct a `string` `Value` from `bytes` with all `\0` bytes removed
+    /// (§6.16). Allocates only when `bytes` actually contains a NUL byte.
+    pub fn from_bytes_strip_nul(bytes: &[u8]) -> Self {
+        if !bytes.contains(&0) {
+            return Self::from_bytes(bytes);
+        }
+        let stripped: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
+        Self::from_bytes(&stripped)
     }
 
     /// Extract f64 from a real-typed value.
@@ -903,8 +1232,11 @@ impl Value {
                 ValueStorage::Inline { val_bits, .. } => f64::from_bits(*val_bits),
                 _ => 0.0,
             }
-        } else if let ValueStorage::Wide(planes) = &self.storage {
-            Self::wide_to_f64(planes, self.width, self.is_signed)
+        } else if let ValueStorage::Bytes(bytes) = &self.storage {
+            let val = ValueStorage::bytes_to_words(bytes, self.width);
+            Self::wide_to_f64(&val, &[], self.width, self.is_signed)
+        } else if let Some((val, xz)) = self.storage.wide_planes() {
+            Self::wide_to_f64(val, xz, self.width, self.is_signed)
         } else {
             if self.is_signed {
                 self.to_i64().unwrap_or(0) as f64
@@ -922,57 +1254,76 @@ impl Value {
         Value::from_f64(if integral == 0.0 { 0.0 } else { integral })
     }
 
-    /// §6.12.2: an integral value wider than 64 bits converted to real,
-    /// rounded to nearest; x and z bits read as 0. The top 64 significant
-    /// bits with a sticky bit for the rest round exactly as the whole value.
-    fn wide_to_f64(planes: &WidePlanes, width: u32, signed: bool) -> f64 {
-        let width = width as usize;
-        let mut words: Vec<u64> = planes
-            .val
-            .iter()
-            .zip(&planes.xz)
-            .map(|(v, x)| v & !x)
-            .collect();
-        if width % 64 != 0
-            && let Some(top) = words.get_mut(width / 64)
-        {
-            *top &= (1u64 << (width % 64)) - 1;
-        }
-        let negative =
-            signed && width > 0 && (words[(width - 1) / 64] >> ((width - 1) % 64)) & 1 == 1;
-        if negative {
-            // Two's complement magnitude at the value's width.
-            let mut carry = 1u64;
-            for w in words.iter_mut() {
-                let (sum, c) = (!*w).overflowing_add(carry);
-                *w = sum;
-                carry = c as u64;
-            }
-            if width % 64 != 0
-                && let Some(top) = words.get_mut(width / 64)
-            {
-                *top &= (1u64 << (width % 64)) - 1;
-            }
-        }
+    #[inline]
+    fn words_mag_to_f64(words: &[u64], negative: bool) -> f64 {
         let Some(hi) = words.iter().rposition(|&w| w != 0) else {
             return 0.0;
         };
         let msb = hi * 64 + 63 - words[hi].leading_zeros() as usize;
-        let bit = |i: usize| (words[i / 64] >> (i % 64)) & 1;
         let magnitude = if msb < 64 {
             words[0] as f64
         } else {
             let low = msb - 63;
-            let mut top = 0u64;
-            for i in (low..=msb).rev() {
-                top = (top << 1) | bit(i);
-            }
-            if (0..low).any(|i| bit(i) == 1) {
+            let wi = low / 64;
+            let off = low % 64;
+            let mut top = if off == 0 {
+                words[wi]
+            } else {
+                (words[wi] >> off) | (words[wi + 1] << (64 - off))
+            };
+            let sticky = words[..wi].iter().any(|&w| w != 0)
+                || (off != 0 && (words[wi] & ((1u64 << off) - 1)) != 0);
+            if sticky {
                 top |= 1;
             }
             top as f64 * 2f64.powi(low as i32)
         };
         if negative { -magnitude } else { magnitude }
+    }
+
+    /// §6.12.2: an integral value wider than 64 bits converted to real,
+    /// rounded to nearest; x and z bits read as 0. The top 64 significant
+    /// bits with a sticky bit for the rest round exactly as the whole value.
+    fn wide_to_f64(val: &[u64], xz: &[u64], width: u32, signed: bool) -> f64 {
+        let w = width as usize;
+        if w == 0 {
+            return 0.0;
+        }
+        let nw = ValueStorage::wide_nwords(width);
+        let top_mask = ValueStorage::top_word_mask(width);
+        let word_at = |i: usize| -> u64 {
+            let v = val.get(i).copied().unwrap_or(0);
+            let x = xz.get(i).copied().unwrap_or(0);
+            let m = if i + 1 == nw { top_mask } else { u64::MAX };
+            (v & !x) & m
+        };
+        let negative = signed && ((word_at((w - 1) / 64) >> ((w - 1) % 64)) & 1 == 1);
+        if !negative && xz.is_empty() && val.len() >= nw && (w.is_multiple_of(64) || val[nw - 1] <= top_mask) {
+            return Self::words_mag_to_f64(&val[..nw], false);
+        }
+        let mut stack = [0u64; 8];
+        let mut heap = Vec::new();
+        let words: &mut [u64] = if nw <= stack.len() {
+            &mut stack[..nw]
+        } else {
+            heap.resize(nw, 0);
+            &mut heap[..]
+        };
+        for (i, slot) in words.iter_mut().enumerate() {
+            *slot = word_at(i);
+        }
+        if negative {
+            let mut carry = 1u64;
+            for wd in words.iter_mut() {
+                let (sum, c) = (!*wd).overflowing_add(carry);
+                *wd = sum;
+                carry = c as u64;
+            }
+            if w % 64 != 0 {
+                words[nw - 1] &= top_mask;
+            }
+        }
+        Self::words_mag_to_f64(words, negative)
     }
 
     /// Extract inline bits for caching. Returns None for Wide values.
@@ -1010,7 +1361,9 @@ impl Value {
     pub fn inline_planes(&self) -> Option<(u64, u64)> {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => Some((*val_bits, *xz_bits)),
-            ValueStorage::Wide(_) => None,
+            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) | ValueStorage::Bytes(_) => {
+                None
+            }
         }
     }
 
@@ -1027,10 +1380,15 @@ impl Value {
     pub fn raw_bits(&self) -> (u64, u64) {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits, *xz_bits),
-            ValueStorage::Wide(bits) => (
-                bits.val.first().copied().unwrap_or(0),
-                bits.xz.first().copied().unwrap_or(0),
-            ),
+            ValueStorage::Wide2State(val) => (val.first().copied().unwrap_or(0), 0),
+            ValueStorage::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                (
+                    buf[..n].first().copied().unwrap_or(0),
+                    buf[n..].first().copied().unwrap_or(0),
+                )
+            }
+            ValueStorage::Bytes(bytes) => (ValueStorage::bytes_word(bytes, 0), 0),
         }
     }
 
@@ -1048,12 +1406,23 @@ impl Value {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 ((*val_bits as u128) & mask, (*xz_bits as u128) & mask)
             }
-            ValueStorage::Wide(bits) => {
+            ValueStorage::Wide2State(val) => {
+                let w0 = val.first().copied().unwrap_or(0) as u128;
+                let w1 = val.get(1).copied().unwrap_or(0) as u128;
+                ((w0 | (w1 << 64)) & mask, 0)
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
                 let word = |p: &[u64], i: usize| p.get(i).copied().unwrap_or(0) as u128;
                 (
-                    (word(&bits.val, 0) | (word(&bits.val, 1) << 64)) & mask,
-                    (word(&bits.xz, 0) | (word(&bits.xz, 1) << 64)) & mask,
+                    (word(val, 0) | (word(val, 1) << 64)) & mask,
+                    (word(xz, 0) | (word(xz, 1) << 64)) & mask,
                 )
+            }
+            ValueStorage::Bytes(bytes) => {
+                let w0 = ValueStorage::bytes_word(bytes, 0) as u128;
+                let w1 = ValueStorage::bytes_word(bytes, 1) as u128;
+                ((w0 | (w1 << 64)) & mask, 0)
             }
         }
     }
@@ -1073,22 +1442,43 @@ impl Value {
                 xz_bits: xw & m,
             };
         } else {
-            let n = WidePlanes::nwords(nbits);
-            match &mut self.storage {
-                ValueStorage::Wide(p) if p.val.len() == n && p.xz.len() == n => {
-                    p.val.fill(vw);
-                    p.xz.fill(xw);
-                    p.nbits = nbits;
-                    p.mask_top();
+            let n = ValueStorage::wide_nwords(nbits);
+            let top = ValueStorage::top_word_mask(nbits);
+            if xw == 0 {
+                match &mut self.storage {
+                    ValueStorage::Wide2State(val) if val.len() == n => {
+                        val.fill(vw);
+                        val[n - 1] &= top;
+                    }
+                    ValueStorage::Wide4State(buf) if buf.len() == 2 * n => {
+                        let (val, xz) = buf.split_at_mut(n);
+                        val.fill(vw);
+                        val[n - 1] &= top;
+                        xz.fill(0);
+                    }
+                    storage => {
+                        let mut val = vec![vw; n].into_boxed_slice();
+                        val[n - 1] &= top;
+                        *storage = ValueStorage::Wide2State(val);
+                    }
                 }
-                storage => {
-                    let mut p = WidePlanes {
-                        val: vec![vw; n],
-                        xz: vec![xw; n],
-                        nbits,
-                    };
-                    p.mask_top();
-                    *storage = ValueStorage::Wide(Box::new(p));
+            } else {
+                match &mut self.storage {
+                    ValueStorage::Wide4State(buf) if buf.len() == 2 * n => {
+                        let (val, xz) = buf.split_at_mut(n);
+                        val.fill(vw);
+                        val[n - 1] &= top;
+                        xz.fill(xw);
+                        xz[n - 1] &= top;
+                    }
+                    storage => {
+                        let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                        buf[..n].fill(vw);
+                        buf[n - 1] &= top;
+                        buf[n..].fill(xw);
+                        buf[2 * n - 1] &= top;
+                        *storage = ValueStorage::Wide4State(buf);
+                    }
                 }
             }
         }
@@ -1140,47 +1530,30 @@ impl Value {
         let (sv, sx) = self.raw_bits();
         let m = Self::mask(self.width);
         let (sv, sx) = (sv & m, sx & m);
-        let nw = WidePlanes::nwords(total);
-        let (mut val, mut xz);
-        if let (Some(vw), Some(xw)) = (
-            Self::repeated_word(sv, self.width),
-            Self::repeated_word(sx, self.width),
-        ) {
-            val = vec![vw; nw];
-            xz = vec![xw; nw];
-        } else {
-            val = vec![0u64; nw];
-            xz = vec![0u64; nw];
-            // Each output word collects the copies overlapping it: copy k
-            // occupies bits [k*w, k*w+w).
-            for wi in 0..nw {
-                let base = wi * 64;
-                let end = (base + 64).min(total as usize);
-                let mut k = base / w;
-                let (mut ov, mut ox) = (0u64, 0u64);
-                while k * w < end {
-                    let pos = k * w;
-                    if pos >= base {
-                        let sh = pos - base;
-                        ov |= sv << sh;
-                        ox |= sx << sh;
-                    } else {
-                        let sh = base - pos;
-                        ov |= sv >> sh;
-                        ox |= sx >> sh;
-                    }
-                    k += 1;
+        let fill_word = |src: u64, wi: usize| -> u64 {
+            let base = wi * 64;
+            let end = (base + 64).min(total as usize);
+            let mut k = base / w;
+            let mut out = 0u64;
+            while k * w < end {
+                let pos = k * w;
+                if pos >= base {
+                    out |= src << (pos - base);
+                } else {
+                    out |= src >> (base - pos);
                 }
-                val[wi] = ov;
-                xz[wi] = ox;
+                k += 1;
             }
-        }
+            out
+        };
         if total <= 64 {
-            let m = Self::mask(total);
+            let tm = Self::mask(total);
+            let val0 = Self::repeated_word(sv, self.width).unwrap_or_else(|| fill_word(sv, 0));
+            let xz0 = Self::repeated_word(sx, self.width).unwrap_or_else(|| fill_word(sx, 0));
             return Value {
                 storage: ValueStorage::Inline {
-                    val_bits: val[0] & m,
-                    xz_bits: xz[0] & m,
+                    val_bits: val0 & tm,
+                    xz_bits: xz0 & tm,
                 },
                 width: total,
                 is_signed: false,
@@ -1188,14 +1561,31 @@ impl Value {
                 is_fill: false,
             };
         }
-        let mut p = WidePlanes {
-            val,
-            xz,
-            nbits: total,
+        let nw = ValueStorage::wide_nwords(total);
+        let top = ValueStorage::top_word_mask(total);
+        let fill_plane = |src: u64, dst: &mut [u64]| {
+            if let Some(word) = Self::repeated_word(src, self.width) {
+                dst.fill(word);
+            } else {
+                for (wi, d) in dst.iter_mut().enumerate() {
+                    *d = fill_word(src, wi);
+                }
+            }
+            dst[nw - 1] &= top;
         };
-        p.mask_top();
+        let storage = if sx == 0 {
+            let mut val = vec![0u64; nw].into_boxed_slice();
+            fill_plane(sv, &mut val);
+            ValueStorage::Wide2State(val)
+        } else {
+            let mut buf = vec![0u64; 2 * nw].into_boxed_slice();
+            let (val, xz) = buf.split_at_mut(nw);
+            fill_plane(sv, val);
+            fill_plane(sx, xz);
+            ValueStorage::Wide4State(buf)
+        };
         Value {
-            storage: ValueStorage::Wide(Box::new(p)),
+            storage,
             width: total,
             is_signed: false,
             is_real: false,
@@ -1212,20 +1602,33 @@ impl Value {
     pub fn assign_wide128(&mut self, v: u128, x: u128, nbits: u32) {
         debug_assert!(nbits > 64 && nbits <= 128);
         let (v0, v1, x0, x1) = (v as u64, (v >> 64) as u64, x as u64, (x >> 64) as u64);
-        match &mut self.storage {
-            ValueStorage::Wide(p) if p.val.len() == 2 && p.xz.len() == 2 => {
-                p.val[0] = v0;
-                p.val[1] = v1;
-                p.xz[0] = x0;
-                p.xz[1] = x1;
-                p.nbits = nbits;
+        if (x0 | x1) == 0 {
+            match &mut self.storage {
+                ValueStorage::Wide2State(p) if p.len() == 2 => {
+                    p[0] = v0;
+                    p[1] = v1;
+                }
+                ValueStorage::Wide4State(p) if p.len() == 4 => {
+                    p[0] = v0;
+                    p[1] = v1;
+                    p[2] = 0;
+                    p[3] = 0;
+                }
+                storage => {
+                    *storage = ValueStorage::Wide2State(Box::new([v0, v1]));
+                }
             }
-            storage => {
-                *storage = ValueStorage::Wide(Box::new(WidePlanes {
-                    val: vec![v0, v1],
-                    xz: vec![x0, x1],
-                    nbits,
-                }));
+        } else {
+            match &mut self.storage {
+                ValueStorage::Wide4State(p) if p.len() == 4 => {
+                    p[0] = v0;
+                    p[1] = v1;
+                    p[2] = x0;
+                    p[3] = x1;
+                }
+                storage => {
+                    *storage = ValueStorage::Wide4State(Box::new([v0, v1, x0, x1]));
+                }
             }
         }
         self.width = nbits;
@@ -1249,29 +1652,20 @@ impl Value {
         let w = w.min(64);
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
+                if w == 0 || lo >= 64 {
+                    return (0, 0);
+                }
                 let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
                 ((val_bits >> lo) & mask, (xz_bits >> lo) & mask)
             }
-            ValueStorage::Wide(bits) => {
-                // Plane extraction: at most two word reads per plane.
-                let nb = bits.nbits as usize;
-                if lo >= nb {
-                    return (0, 0);
-                }
-                let w = w.min(nb - lo);
-                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-                let (wi, off) = (lo / 64, lo % 64);
-                let take = |plane: &[u64]| -> u64 {
-                    let lo64 = plane.get(wi).copied().unwrap_or(0) >> off;
-                    let hi64 = if off > 0 {
-                        plane.get(wi + 1).copied().unwrap_or(0) << (64 - off)
-                    } else {
-                        0
-                    };
-                    (lo64 | hi64) & mask
-                };
-                (take(&bits.val), take(&bits.xz))
+            ValueStorage::Wide2State(val) => {
+                ValueStorage::wide_extract64(val, &[], self.width, lo, w)
             }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                ValueStorage::wide_extract64(val, xz, self.width, lo, w)
+            }
+            ValueStorage::Bytes(bytes) => ValueStorage::bytes_slice64(bytes, self.width, lo, w),
         }
     }
 
@@ -1292,13 +1686,23 @@ impl Value {
                 v[1] = 0;
                 true
             }
-            ValueStorage::Wide(bits) => {
-                // Planes: clean test is a word scan, extraction two copies.
-                if bits.any_xz() {
+            ValueStorage::Wide2State(val) => {
+                v[0] = val.first().copied().unwrap_or(0);
+                v[1] = val.get(1).copied().unwrap_or(0);
+                true
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                if xz.iter().any(|&w| w != 0) {
                     return false;
                 }
-                v[0] = bits.val.first().copied().unwrap_or(0);
-                v[1] = bits.val.get(1).copied().unwrap_or(0);
+                v[0] = val.first().copied().unwrap_or(0);
+                v[1] = val.get(1).copied().unwrap_or(0);
+                true
+            }
+            ValueStorage::Bytes(bytes) => {
+                v[0] = ValueStorage::bytes_word(bytes, 0);
+                v[1] = ValueStorage::bytes_word(bytes, 1);
                 true
             }
         }
@@ -1309,6 +1713,7 @@ impl Value {
     /// the storage kind. Returns true when the stored value CHANGED. Bits of
     /// `v` above the width must already be masked by the caller.
     pub fn set_words128(&mut self, v: [u64; 2]) -> bool {
+        self.storage.materialize_bytes_to_wide2(self.width);
         match &mut self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 let changed = *val_bits != v[0] || *xz_bits != 0;
@@ -1316,32 +1721,53 @@ impl Value {
                 *xz_bits = 0;
                 changed
             }
-            ValueStorage::Wide(bits) => {
-                // Planes: masked word compare-and-store, X/Z cleared.
-                let nb = bits.nbits;
-                let n = WidePlanes::nwords(nb).min(2);
+            ValueStorage::Wide2State(val) => {
+                let nb = self.width;
+                let n = ValueStorage::wide_nwords(nb).min(2).min(val.len());
                 let mut want = [0u64; 2];
                 want[0] = v[0];
                 if n > 1 {
                     want[1] = v[1];
                 }
-                let r = (nb % 64) as u64;
-                if r != 0 && WidePlanes::nwords(nb) <= 2 {
-                    want[n - 1] &= (1u64 << r) - 1;
+                if ValueStorage::wide_nwords(nb) <= 2 && n > 0 {
+                    want[n - 1] &= ValueStorage::top_word_mask(nb);
                 }
                 let mut changed = false;
                 for wi in 0..n {
-                    if bits.val[wi] != want[wi] {
-                        bits.val[wi] = want[wi];
-                        changed = true;
-                    }
-                    if bits.xz[wi] != 0 {
-                        bits.xz[wi] = 0;
+                    if val[wi] != want[wi] {
+                        val[wi] = want[wi];
                         changed = true;
                     }
                 }
                 changed
             }
+            ValueStorage::Wide4State(buf) => {
+                let nb = self.width;
+                let half = buf.len() / 2;
+                let n = ValueStorage::wide_nwords(nb).min(2).min(half);
+                let (val, xz) = buf.split_at_mut(half);
+                let mut want = [0u64; 2];
+                want[0] = v[0];
+                if n > 1 {
+                    want[1] = v[1];
+                }
+                if ValueStorage::wide_nwords(nb) <= 2 && n > 0 {
+                    want[n - 1] &= ValueStorage::top_word_mask(nb);
+                }
+                let mut changed = false;
+                for wi in 0..n {
+                    if val[wi] != want[wi] {
+                        val[wi] = want[wi];
+                        changed = true;
+                    }
+                    if xz[wi] != 0 {
+                        xz[wi] = 0;
+                        changed = true;
+                    }
+                }
+                changed
+            }
+            ValueStorage::Bytes(_) => unreachable!(),
         }
     }
 
@@ -1351,14 +1777,8 @@ impl Value {
         if width <= 64 {
             return Value::from_u64(v[0], width);
         }
-        let mut bits = vec![LogicBit::Zero; width as usize];
-        for (i, b) in bits.iter_mut().enumerate() {
-            if (v[i >> 6] >> (i & 63)) & 1 != 0 {
-                *b = LogicBit::One;
-            }
-        }
         Value {
-            storage: ValueStorage::Wide(Box::new(WidePlanes::from_bits(&bits))),
+            storage: ValueStorage::wide_from_val_words(&v, width),
             width,
             is_signed: false,
             is_real: false,
@@ -1385,12 +1805,25 @@ impl Value {
                 }
                 true
             }
-            ValueStorage::Wide(bits) => {
-                if bits.any_xz() {
+            ValueStorage::Wide2State(val) => {
+                for (i, w) in v.iter_mut().enumerate() {
+                    *w = val.get(i).copied().unwrap_or(0);
+                }
+                true
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                if xz.iter().any(|&w| w != 0) {
                     return false;
                 }
                 for (i, w) in v.iter_mut().enumerate() {
-                    *w = bits.val.get(i).copied().unwrap_or(0);
+                    *w = val.get(i).copied().unwrap_or(0);
+                }
+                true
+            }
+            ValueStorage::Bytes(bytes) => {
+                for (i, w) in v.iter_mut().enumerate() {
+                    *w = ValueStorage::bytes_word(bytes, i);
                 }
                 true
             }
@@ -1410,24 +1843,63 @@ impl Value {
                 *xz_bits = 0;
                 changed
             }
-            ValueStorage::Wide(bits) => {
-                let nb = bits.nbits;
-                let n = WidePlanes::nwords(nb).min(bits.val.len());
-                let r = (nb % 64) as u64;
+            ValueStorage::Wide2State(val) => {
+                let nb = self.width;
+                let n = ValueStorage::wide_nwords(nb).min(val.len());
+                let top = ValueStorage::top_word_mask(nb);
+                let mut changed = false;
+                for (wi, d) in val[..n].iter_mut().enumerate() {
+                    let mut want = v.get(wi).copied().unwrap_or(0);
+                    if wi + 1 == n {
+                        want &= top;
+                    }
+                    if *d != want {
+                        *d = want;
+                        changed = true;
+                    }
+                }
+                changed
+            }
+            ValueStorage::Wide4State(buf) => {
+                let nb = self.width;
+                let half = buf.len() / 2;
+                let n = ValueStorage::wide_nwords(nb).min(half);
+                let top = ValueStorage::top_word_mask(nb);
+                let (val, xz) = buf.split_at_mut(half);
                 let mut changed = false;
                 for wi in 0..n {
                     let mut want = v.get(wi).copied().unwrap_or(0);
-                    if wi + 1 == n && r != 0 {
-                        want &= (1u64 << r) - 1;
+                    if wi + 1 == n {
+                        want &= top;
                     }
-                    if bits.val[wi] != want {
-                        bits.val[wi] = want;
+                    if val[wi] != want {
+                        val[wi] = want;
                         changed = true;
                     }
-                    if bits.xz[wi] != 0 {
-                        bits.xz[wi] = 0;
+                    if xz[wi] != 0 {
+                        xz[wi] = 0;
                         changed = true;
                     }
+                }
+                changed
+            }
+            ValueStorage::Bytes(bytes) => {
+                let nb = self.width;
+                let n = ValueStorage::wide_nwords(nb);
+                let top = ValueStorage::top_word_mask(nb);
+                let mut changed = false;
+                for wi in 0..n {
+                    let mut want = v.get(wi).copied().unwrap_or(0);
+                    if wi + 1 == n {
+                        want &= top;
+                    }
+                    if ValueStorage::bytes_word(bytes, wi) != want {
+                        changed = true;
+                        break;
+                    }
+                }
+                if changed {
+                    self.storage = ValueStorage::wide_from_val_words(v, nb);
                 }
                 changed
             }
@@ -1588,18 +2060,8 @@ impl Value {
         if width <= 64 {
             return Value::from_u64(v.first().copied().unwrap_or(0), width);
         }
-        let n = WidePlanes::nwords(width);
-        let mut val: Vec<u64> = (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect();
-        let r = width % 64;
-        if r != 0 {
-            val[n - 1] &= (1u64 << r) - 1;
-        }
         Value {
-            storage: ValueStorage::Wide(Box::new(WidePlanes {
-                val,
-                xz: vec![0; n],
-                nbits: width,
-            })),
+            storage: ValueStorage::wide_from_val_words(v, width),
             width,
             is_signed: false,
             is_real: false,
@@ -1607,12 +2069,15 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
-            // A word scan of the xz plane; the per-bit iterator walk was
-            // 1.9 % of a c906 run (every wide two-state guard asks this).
-            ValueStorage::Wide(bits) => bits.xz.iter().any(|w| *w != 0),
+            ValueStorage::Wide2State(_) | ValueStorage::Bytes(_) => false,
+            ValueStorage::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                buf[n..].iter().any(|&w| w != 0)
+            }
         }
     }
 
@@ -1623,31 +2088,219 @@ impl Value {
     /// fully defined (xz cleared).
     #[inline]
     pub fn to_two_state(&self) -> Value {
-        if self.is_real || !self.has_xz() {
+        if self.is_real {
             return self.clone();
         }
         match &self.storage {
-            ValueStorage::Inline { val_bits, xz_bits } => Value {
-                storage: ValueStorage::Inline {
-                    val_bits: *val_bits & !*xz_bits,
-                    xz_bits: 0,
-                },
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if *xz_bits == 0 {
+                    return self.clone();
+                }
+                Value {
+                    storage: ValueStorage::Inline {
+                        val_bits: *val_bits & !*xz_bits,
+                        xz_bits: 0,
+                    },
+                    width: self.width,
+                    is_signed: self.is_signed,
+                    is_real: false,
+                    is_fill: false,
+                }
+            }
+            ValueStorage::Wide2State(_) | ValueStorage::Bytes(_) => self.clone(),
+            ValueStorage::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                let (val, xz) = buf.split_at(n);
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(val[i] & !xz[i]);
+                }
+                Value {
+                    storage: ValueStorage::Wide2State(out.into_boxed_slice()),
+                    width: self.width,
+                    is_signed: self.is_signed,
+                    is_real: false,
+                    is_fill: self.is_fill,
+                }
+            }
+        }
+    }
+
+    /// Coerce to 2-state in place (X/Z -> 0), avoiding `clone()` allocations.
+    #[inline]
+    pub fn drop_xz_in_place(&mut self) {
+        if self.is_real {
+            return;
+        }
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                *val_bits &= !*xz_bits;
+                *xz_bits = 0;
+            }
+            ValueStorage::Wide2State(_) | ValueStorage::Bytes(_) => {}
+            ValueStorage::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                let (val, xz) = buf.split_at_mut(n);
+                for i in 0..n {
+                    val[i] &= !xz[i];
+                    xz[i] = 0;
+                }
+            }
+        }
+    }
+
+    /// IEEE 1800 §11.4.14.2 `{<< slice { ... }}`: reverse contiguous `slice_bits`
+    /// slices (with any partial remainder moved to the LSB position) in word
+    /// chunks rather than bit by bit.
+    pub fn reverse_slices(&self, slice_bits: usize) -> Value {
+        let total_w = self.width as usize;
+        if total_w == 0 || slice_bits == 0 || slice_bits >= total_w {
+            return Value {
+                storage: self.storage.clone(),
                 width: self.width,
-                is_signed: self.is_signed,
+                is_signed: false,
                 is_real: false,
                 is_fill: false,
-            },
-            ValueStorage::Wide(_bits) => {
-                let mut out = self.clone();
-                if let ValueStorage::Wide(ob) = &mut out.storage {
-                    // X/Z -> 0: clear the value bit wherever xz is set.
-                    for wi in 0..ob.val.len() {
-                        ob.val[wi] &= !ob.xz[wi];
-                        ob.xz[wi] = 0;
+            };
+        }
+        if let ValueStorage::Inline { val_bits, xz_bits } = self.storage {
+            let mask = Self::mask(self.width);
+            let sv = val_bits & mask;
+            let sx = xz_bits & mask;
+            if slice_bits == 1 {
+                let sh = 64 - total_w;
+                return Value {
+                    storage: ValueStorage::Inline {
+                        val_bits: sv.reverse_bits() >> sh,
+                        xz_bits: sx.reverse_bits() >> sh,
+                    },
+                    width: self.width,
+                    is_signed: false,
+                    is_real: false,
+                    is_fill: false,
+                };
+            }
+            if slice_bits == 8 && total_w.is_multiple_of(8) {
+                let nbytes = total_w / 8;
+                let sh = (8 - nbytes) * 8;
+                return Value {
+                    storage: ValueStorage::Inline {
+                        val_bits: sv.swap_bytes() >> sh,
+                        xz_bits: sx.swap_bytes() >> sh,
+                    },
+                    width: self.width,
+                    is_signed: false,
+                    is_real: false,
+                    is_fill: false,
+                };
+            }
+            let full = total_w / slice_bits;
+            let rem = total_w % slice_bits;
+            let chunk_mask = (1u64 << slice_bits) - 1;
+            let (mut ov, mut ox) = (0u64, 0u64);
+            for k in 0..full {
+                let src_off = k * slice_bits;
+                let dst_off = (full - 1 - k) * slice_bits + rem;
+                ov |= ((sv >> src_off) & chunk_mask) << dst_off;
+                ox |= ((sx >> src_off) & chunk_mask) << dst_off;
+            }
+            if rem > 0 {
+                let rem_mask = (1u64 << rem) - 1;
+                ov |= (sv >> (full * slice_bits)) & rem_mask;
+                ox |= (sx >> (full * slice_bits)) & rem_mask;
+            }
+            return Value {
+                storage: ValueStorage::Inline {
+                    val_bits: ov,
+                    xz_bits: ox,
+                },
+                width: self.width,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            };
+        }
+
+        let bytes_words;
+        let (sv_words, sx_words): (&[u64], &[u64]) = match &self.storage {
+            ValueStorage::Bytes(b) => {
+                bytes_words = ValueStorage::bytes_to_words(b, self.width);
+                (&bytes_words, &[])
+            }
+            _ => {
+                let Some(planes) = self.storage.wide_planes() else {
+                    return Value::zero(self.width);
+                };
+                planes
+            }
+        };
+        let has_xz = self.has_xz();
+        let n = ValueStorage::wide_nwords(self.width);
+        let mut storage = if has_xz {
+            ValueStorage::Wide4State(vec![0u64; 2 * n].into_boxed_slice())
+        } else {
+            ValueStorage::Wide2State(vec![0u64; n].into_boxed_slice())
+        };
+        if slice_bits == 1 {
+            let mut dst_pos = 0usize;
+            for wi in 0..n {
+                let chunk_n = (total_w - dst_pos).min(64);
+                let src_lo = total_w - dst_pos - chunk_n;
+                let (rv, rx) = ValueStorage::wide_extract64(
+                    sv_words, sx_words, self.width, src_lo, chunk_n,
+                );
+                let sh = 64 - chunk_n;
+                if let Some((dv, dx)) = storage.wide_planes_mut() {
+                    dv[wi] = rv.reverse_bits() >> sh;
+                    if let Some(dx) = dx {
+                        dx[wi] = rx.reverse_bits() >> sh;
                     }
                 }
-                out
+                dst_pos += chunk_n;
             }
+        } else {
+            let full = total_w / slice_bits;
+            let rem = total_w % slice_bits;
+            for k in 0..full {
+                let src_base = k * slice_bits;
+                let dst_base = (full - 1 - k) * slice_bits + rem;
+                let mut off = 0usize;
+                while off < slice_bits {
+                    let take = (slice_bits - off).min(64);
+                    let (v, x) = ValueStorage::wide_extract64(
+                        sv_words,
+                        sx_words,
+                        self.width,
+                        src_base + off,
+                        take,
+                    );
+                    storage.wide_splice64(self.width, dst_base + off, v, x, take);
+                    off += take;
+                }
+            }
+            if rem > 0 {
+                let src_base = full * slice_bits;
+                let mut off = 0usize;
+                while off < rem {
+                    let take = (rem - off).min(64);
+                    let (v, x) = ValueStorage::wide_extract64(
+                        sv_words,
+                        sx_words,
+                        self.width,
+                        src_base + off,
+                        take,
+                    );
+                    storage.wide_splice64(self.width, off, v, x, take);
+                    off += take;
+                }
+            }
+        }
+        Value {
+            storage,
+            width: self.width,
+            is_signed: false,
+            is_real: false,
+            is_fill: false,
         }
     }
 
@@ -1681,7 +2334,12 @@ impl Value {
                     (_, _) => LogicBit::Z,
                 }
             }
-            ValueStorage::Wide(bits) => bits.get(i),
+            ValueStorage::Wide2State(val) => ValueStorage::wide_get(val, &[], i),
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                ValueStorage::wide_get(val, xz, i)
+            }
+            ValueStorage::Bytes(bytes) => ValueStorage::bytes_get(bytes, i),
         }
     }
 
@@ -1700,10 +2358,12 @@ impl Value {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 (((*xz_bits >> i) & 1) << 1 | ((*val_bits >> i) & 1)) as u8
             }
-            // `LogicBit` is `#[repr(u8)]` with exactly these discriminants, so
-            // the four-way match this used to run IS the identity cast (and
-            // `LogicBit::Zero as u8 == 0` covers the out-of-range default).
-            ValueStorage::Wide(bits) => bits.get(i) as u8,
+            ValueStorage::Wide2State(val) => ValueStorage::wide_get(val, &[], i) as u8,
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                ValueStorage::wide_get(val, xz, i) as u8
+            }
+            ValueStorage::Bytes(bytes) => ValueStorage::bytes_get_code(bytes, i),
         }
     }
 
@@ -1734,12 +2394,30 @@ impl Value {
                 *xz_bits = nx;
                 true
             }
-            ValueStorage::Wide(bits) => {
-                let (cv, cx) = bits.extract64(pos, n);
+            ValueStorage::Wide2State(val) => {
+                let (cv, cx) = ValueStorage::wide_extract64(val, &[], self.width, pos, n);
                 if cv == v && cx == x {
                     return false;
                 }
-                bits.splice64(pos, v, x, n);
+                self.storage.wide_splice64(self.width, pos, v, x, n);
+                true
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                let (cv, cx) = ValueStorage::wide_extract64(val, xz, self.width, pos, n);
+                if cv == v && cx == x {
+                    return false;
+                }
+                self.storage.wide_splice64(self.width, pos, v, x, n);
+                true
+            }
+            ValueStorage::Bytes(bytes) => {
+                let (cv, cx) = ValueStorage::bytes_slice64(bytes, self.width, pos, n);
+                if cv == v && cx == x {
+                    return false;
+                }
+                self.storage.materialize_bytes_to_wide2(self.width);
+                self.storage.wide_splice64(self.width, pos, v, x, n);
                 true
             }
         }
@@ -1768,22 +2446,30 @@ impl Value {
                 }
                 true
             }
-            ValueStorage::Wide(bits) => {
-                let bit = match code {
-                    0 => LogicBit::Zero,
-                    1 => LogicBit::One,
-                    2 => LogicBit::X,
-                    _ => LogicBit::Z,
-                };
-                if i < bits.nbits as usize {
-                    if bits.get(i) == bit {
-                        return false;
-                    }
-                    bits.set(i, bit);
-                    true
-                } else {
-                    false
+            ValueStorage::Wide2State(val) => {
+                let bit = LogicBit::from_code(code);
+                if ValueStorage::wide_get(val, &[], i) == bit {
+                    return false;
                 }
+                self.storage.wide_set(i, bit);
+                true
+            }
+            ValueStorage::Wide4State(buf) => {
+                let bit = LogicBit::from_code(code);
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                if ValueStorage::wide_get(val, xz, i) == bit {
+                    return false;
+                }
+                self.storage.wide_set(i, bit);
+                true
+            }
+            ValueStorage::Bytes(bytes) => {
+                if ValueStorage::bytes_get_code(bytes, i) == code {
+                    return false;
+                }
+                self.storage.materialize_bytes_to_wide2(self.width);
+                self.storage.wide_set(i, LogicBit::from_code(code));
+                true
             }
         }
     }
@@ -1803,7 +2489,9 @@ impl Value {
                 *xz_bits = new_xz;
                 true
             }
-            ValueStorage::Wide(_) => self.set_bit_code(0, code),
+            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) | ValueStorage::Bytes(_) => {
+                self.set_bit_code(0, code)
+            }
         }
     }
 
@@ -1836,8 +2524,8 @@ impl Value {
                     }
                 }
             }
-            ValueStorage::Wide(bits) => {
-                bits.set(i, bit);
+            ValueStorage::Wide2State(_) | ValueStorage::Wide4State(_) | ValueStorage::Bytes(_) => {
+                self.storage.wide_set(i, bit);
             }
         }
     }
@@ -1858,17 +2546,30 @@ impl Value {
         if count == 0 {
             return false;
         }
-        match (&mut self.storage, &source.storage) {
+        self.storage.materialize_bytes_to_wide2(self.width);
+        let src_bytes_words;
+        let src_planes = match &source.storage {
+            ValueStorage::Bytes(b) => {
+                src_bytes_words = ValueStorage::bytes_to_words(b, source.width);
+                Some((&src_bytes_words[..], &[][..]))
+            }
+            _ => source.storage.wide_planes(),
+        };
+        match (&mut self.storage, src_planes) {
             (
                 ValueStorage::Inline {
                     val_bits: dst_v,
                     xz_bits: dst_x,
                 },
-                ValueStorage::Inline {
+                None,
+            ) => {
+                let ValueStorage::Inline {
                     val_bits: src_v,
                     xz_bits: src_x,
-                },
-            ) => {
+                } = &source.storage
+                else {
+                    return false;
+                };
                 let low_mask = if count >= 64 {
                     u64::MAX
                 } else {
@@ -1882,55 +2583,20 @@ impl Value {
                 *dst_x = next_x;
                 changed
             }
-            // Word-wise for every wide combination: the former per-bit
-            // get/set walk was 2.4 % of a c906 run on its own (every wide
-            // comb-block store copies its result through here).
-            (ValueStorage::Wide(dst), ValueStorage::Wide(src)) => {
-                let mut changed = false;
-                let mut off = 0usize;
-                while off < count {
-                    let n = (count - off).min(64);
-                    let (sv, sx) = src.extract64(src_start + off, n);
-                    let (dv, dx) = dst.extract64(dst_start + off, n);
-                    if sv != dv || sx != dx {
-                        dst.splice64(dst_start + off, sv, sx, n);
-                        changed = true;
-                    }
-                    off += n;
-                }
-                changed
-            }
-            (ValueStorage::Wide(dst), ValueStorage::Inline { val_bits, xz_bits }) => {
-                let mut changed = false;
-                let mut off = 0usize;
-                while off < count {
-                    let n = (count - off).min(64);
-                    let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
-                    let pos = src_start + off;
-                    let (sv, sx) = if pos >= 64 {
-                        (0, 0)
-                    } else {
-                        ((*val_bits >> pos) & mask, (*xz_bits >> pos) & mask)
-                    };
-                    let (dv, dx) = dst.extract64(dst_start + off, n);
-                    if sv != dv || sx != dx {
-                        dst.splice64(dst_start + off, sv, sx, n);
-                        changed = true;
-                    }
-                    off += n;
-                }
-                changed
-            }
             (
                 ValueStorage::Inline {
                     val_bits: dst_v,
                     xz_bits: dst_x,
                 },
-                ValueStorage::Wide(src),
+                Some((sv_p, sx_p)),
             ) => {
-                // The destination holds at most 64 live bits, so one
-                // extraction covers the whole copy.
-                let (sv, sx) = src.extract64(src_start, count);
+                let (sv, sx) = ValueStorage::wide_extract64(
+                    sv_p,
+                    sx_p,
+                    source.width,
+                    src_start,
+                    count,
+                );
                 let low_mask = if count >= 64 {
                     u64::MAX
                 } else {
@@ -1944,30 +2610,85 @@ impl Value {
                 *dst_x = next_x;
                 changed
             }
+            (dst_wide, Some((sv_p, sx_p))) => {
+                let mut changed = false;
+                let mut off = 0usize;
+                let dst_w = self.width;
+                while off < count {
+                    let n = (count - off).min(64);
+                    let (sv, sx) = ValueStorage::wide_extract64(
+                        sv_p,
+                        sx_p,
+                        source.width,
+                        src_start + off,
+                        n,
+                    );
+                    let (dv, dx) = match &*dst_wide {
+                        ValueStorage::Wide2State(val) => {
+                            ValueStorage::wide_extract64(val, &[], dst_w, dst_start + off, n)
+                        }
+                        ValueStorage::Wide4State(buf) => {
+                            let (val, xz) = buf.split_at(buf.len() / 2);
+                            ValueStorage::wide_extract64(val, xz, dst_w, dst_start + off, n)
+                        }
+                        ValueStorage::Inline { .. } | ValueStorage::Bytes(_) => unreachable!(),
+                    };
+                    if sv != dv || sx != dx {
+                        dst_wide.wide_splice64(dst_w, dst_start + off, sv, sx, n);
+                        changed = true;
+                    }
+                    off += n;
+                }
+                changed
+            }
+            (dst_wide, None) => {
+                let ValueStorage::Inline { val_bits, xz_bits } = &source.storage else {
+                    return false;
+                };
+                let mut changed = false;
+                let mut off = 0usize;
+                let dst_w = self.width;
+                while off < count {
+                    let n = (count - off).min(64);
+                    let mask = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+                    let pos = src_start + off;
+                    let (sv, sx) = if pos >= 64 {
+                        (0, 0)
+                    } else {
+                        ((*val_bits >> pos) & mask, (*xz_bits >> pos) & mask)
+                    };
+                    let (dv, dx) = match &*dst_wide {
+                        ValueStorage::Wide2State(val) => {
+                            ValueStorage::wide_extract64(val, &[], dst_w, dst_start + off, n)
+                        }
+                        ValueStorage::Wide4State(buf) => {
+                            let (val, xz) = buf.split_at(buf.len() / 2);
+                            ValueStorage::wide_extract64(val, xz, dst_w, dst_start + off, n)
+                        }
+                        ValueStorage::Inline { .. } | ValueStorage::Bytes(_) => unreachable!(),
+                    };
+                    if sv != dv || sx != dx {
+                        dst_wide.wide_splice64(dst_w, dst_start + off, sv, sx, n);
+                        changed = true;
+                    }
+                    off += n;
+                }
+                changed
+            }
         }
     }
 
-    /// Convert to `u64`, treating X/Z as 0.
-    ///
-    /// **Returns the LOW 64 bits for wide values**: any bits at positions
-    /// ≥ 64 are silently dropped. The return type is `Option` for symmetry
-    /// with potential X/Z failure paths but in practice always returns
-    /// `Some(_)` for both inline and wide storage.
-    ///
-    /// Use this only when the value is known to fit in 64 bits —
-    /// typically array indices, bit positions, loop counters, or shift
-    /// amounts. For signal values that may exceed 64 bits (Verilog supports
-    /// arbitrary widths), prefer `to_u128()`, `get_bits()`, or
-    /// Value-aware comparisons.
     #[inline(always)]
     pub fn to_u64(&self) -> Option<u64> {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => Some(*val_bits & !*xz_bits),
-            ValueStorage::Wide(bits) => {
-                let result =
-                    bits.val.first().copied().unwrap_or(0) & !bits.xz.first().copied().unwrap_or(0);
+            ValueStorage::Wide2State(val) => Some(val.first().copied().unwrap_or(0)),
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                let result = val.first().copied().unwrap_or(0) & !xz.first().copied().unwrap_or(0);
                 Some(result)
             }
+            ValueStorage::Bytes(bytes) => Some(ValueStorage::bytes_word(bytes, 0)),
         }
     }
 
@@ -1982,10 +2703,51 @@ impl Value {
                     64 - (v - 1).leading_zeros()
                 }
             }
-            ValueStorage::Wide(bits) => {
+            ValueStorage::Wide2State(val) => {
                 let mut highest = None;
-                for (i, (&v, &x)) in bits.val.iter().zip(&bits.xz).enumerate().rev() {
+                for (i, &v) in val.iter().enumerate().rev() {
+                    if v == 0 {
+                        continue;
+                    }
+                    if let Some(width) = highest {
+                        return width;
+                    }
+                    let width = i as u32 * 64 + (64 - v.leading_zeros());
+                    if !v.is_power_of_two() {
+                        return width;
+                    }
+                    highest = Some(width);
+                }
+                highest.map_or(0, |width| width - 1)
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                let mut highest = None;
+                for (i, (&v, &x)) in val.iter().zip(xz).enumerate().rev() {
                     let v = v & !x;
+                    if v == 0 {
+                        continue;
+                    }
+                    if let Some(width) = highest {
+                        return width;
+                    }
+                    let width = i as u32 * 64 + (64 - v.leading_zeros());
+                    if !v.is_power_of_two() {
+                        return width;
+                    }
+                    highest = Some(width);
+                }
+                highest.map_or(0, |width| width - 1)
+            }
+            ValueStorage::Bytes(bytes) => {
+                let nw = ValueStorage::wide_nwords(self.width);
+                let top = ValueStorage::top_word_mask(self.width);
+                let mut highest = None;
+                for i in (0..nw).rev() {
+                    let mut v = ValueStorage::bytes_word(bytes, i);
+                    if i + 1 == nw {
+                        v &= top;
+                    }
                     if v == 0 {
                         continue;
                     }
@@ -2233,14 +2995,25 @@ impl Value {
     /// multi-word arithmetic below works on these for results wider than
     /// 128 bits, where the `u128` paths silently dropped every higher bit.
     fn arith_words(&self, w: u32, sext: bool) -> Vec<u64> {
-        let n = WidePlanes::nwords(w);
+        let n = ValueStorage::wide_nwords(w);
         let mut out = vec![0u64; n];
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => out[0] = *val_bits & !*xz_bits,
-            ValueStorage::Wide(bits) => {
+            ValueStorage::Wide2State(val) => {
+                let copy_n = val.len().min(n);
+                out[..copy_n].copy_from_slice(&val[..copy_n]);
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
                 for (i, o) in out.iter_mut().enumerate() {
-                    *o = bits.val.get(i).copied().unwrap_or(0)
-                        & !bits.xz.get(i).copied().unwrap_or(0);
+                    *o = val.get(i).copied().unwrap_or(0) & !xz.get(i).copied().unwrap_or(0);
+                }
+            }
+            ValueStorage::Bytes(bytes) => {
+                let nw = ValueStorage::wide_nwords((bytes.len() * 8) as u32);
+                let copy_n = nw.min(n);
+                for (wi, o) in out[..copy_n].iter_mut().enumerate() {
+                    *o = ValueStorage::bytes_word(bytes, wi);
                 }
             }
         }
@@ -2381,20 +3154,70 @@ impl Value {
     /// wider side's); signed only when both are.
     fn wide_cmp(&self, other: &Value) -> std::cmp::Ordering {
         let w = self.width.max(other.width);
+        if w == 0 {
+            return std::cmp::Ordering::Equal;
+        }
         let signed = self.is_signed && other.is_signed;
-        let a = self.arith_words(w, signed);
-        let b = other.arith_words(w, signed);
-        if signed {
-            let (an, bn) = (Self::words_msb(&a, w), Self::words_msb(&b, w));
-            if an != bn {
-                return if an {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Greater
-                };
+        let nw = ValueStorage::wide_nwords(w);
+        let top_mask = ValueStorage::top_word_mask(w);
+        let raw_word = |v: &Value, i: usize| -> u64 {
+            match &v.storage {
+                ValueStorage::Inline { val_bits, xz_bits } => {
+                    if i == 0 {
+                        *val_bits & !*xz_bits
+                    } else {
+                        0
+                    }
+                }
+                ValueStorage::Wide2State(val) => val.get(i).copied().unwrap_or(0),
+                ValueStorage::Wide4State(buf) => {
+                    let (val, xz) = buf.split_at(buf.len() / 2);
+                    val.get(i).copied().unwrap_or(0) & !xz.get(i).copied().unwrap_or(0)
+                }
+                ValueStorage::Bytes(bytes) => ValueStorage::bytes_word(bytes, i),
+            }
+        };
+        let sign_of = |v: &Value| -> (bool, u64) {
+            let sw = v.width.min(w) as usize;
+            if signed && sw > 0 {
+                let neg = ((raw_word(v, (sw - 1) / 64) >> ((sw - 1) % 64)) & 1) == 1;
+                (neg, if neg { u64::MAX } else { 0 })
+            } else {
+                (false, 0)
+            }
+        };
+        let (an, a_fill) = sign_of(self);
+        let (bn, b_fill) = sign_of(other);
+        if signed && an != bn {
+            return if an {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            };
+        }
+        let word_at = |v: &Value, fill: u64, wi: usize| -> u64 {
+            let sw = v.width.min(w) as usize;
+            let lo = wi * 64;
+            let mut res = if lo >= sw {
+                fill
+            } else if lo + 64 <= sw {
+                raw_word(v, wi)
+            } else {
+                let keep = (1u64 << (sw - lo)) - 1;
+                (raw_word(v, wi) & keep) | (fill & !keep)
+            };
+            if wi + 1 == nw {
+                res &= top_mask;
+            }
+            res
+        };
+        for wi in (0..nw).rev() {
+            match word_at(self, a_fill, wi).cmp(&word_at(other, b_fill, wi)) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
             }
         }
-        Self::words_cmp(&a, &b)
+        std::cmp::Ordering::Equal
     }
 
     #[inline]
@@ -2879,7 +3702,7 @@ impl Value {
         if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
             // A KNOWN 0 on either side forces 0; two known 1s give 1; anything
             // else is x. "known 0" is `!val & !xz`, "known 1" is `val & !xz`.
-            let bits = Self::wide_bitwise_lanes(
+            return Self::wide_bitwise_lanes(
                 a,
                 b,
                 w,
@@ -2890,7 +3713,6 @@ impl Value {
                 },
                 op_bit,
             );
-            return Self::wide_bitwise_value(bits, w);
         }
         self.bitwise_op_slow(other, op_bit)
     }
@@ -2955,7 +3777,7 @@ impl Value {
         if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
             // A KNOWN 1 on either side forces 1; two known 0s give 0; anything
             // else is x.
-            let bits = Self::wide_bitwise_lanes(
+            return Self::wide_bitwise_lanes(
                 a,
                 b,
                 w,
@@ -2966,7 +3788,6 @@ impl Value {
                 },
                 op_bit,
             );
-            return Self::wide_bitwise_value(bits, w);
         }
         self.bitwise_op_slow(other, op_bit)
     }
@@ -3017,7 +3838,7 @@ impl Value {
         };
         if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
             // Known on BOTH sides gives their xor; any unknown gives x.
-            let bits = Self::wide_bitwise_lanes(
+            return Self::wide_bitwise_lanes(
                 a,
                 b,
                 w,
@@ -3027,7 +3848,6 @@ impl Value {
                 },
                 op_bit,
             );
-            return Self::wide_bitwise_value(bits, w);
         }
         self.bitwise_op_slow(other, op_bit)
     }
@@ -3054,17 +3874,75 @@ impl Value {
                     is_fill: false,
                 }
             }
-            ValueStorage::Wide(bits) => {
-                let new_bits: Vec<LogicBit> = bits
-                    .iter()
-                    .map(|b| match b {
-                        LogicBit::Zero => LogicBit::One,
-                        LogicBit::One => LogicBit::Zero,
-                        _ => LogicBit::X,
-                    })
-                    .collect();
+            ValueStorage::Wide2State(val) => {
+                let nw = ValueStorage::wide_nwords(self.width).min(val.len());
+                let top = ValueStorage::top_word_mask(self.width);
+                let mut out = Vec::with_capacity(nw);
+                for (i, &v) in val[..nw].iter().enumerate() {
+                    let mut nv = !v;
+                    if i + 1 == nw {
+                        nv &= top;
+                    }
+                    out.push(nv);
+                }
                 Value {
-                    storage: ValueStorage::Wide(Box::new(WidePlanes::from_bits(&new_bits))),
+                    storage: ValueStorage::Wide2State(out.into_boxed_slice()),
+                    width: self.width,
+                    is_signed: self.is_signed,
+                    is_real: false,
+                    is_fill: false,
+                }
+            }
+            ValueStorage::Wide4State(buf) => {
+                let half = buf.len() / 2;
+                let (val, xz) = buf.split_at(half);
+                let nw = ValueStorage::wide_nwords(self.width).min(half);
+                let top = ValueStorage::top_word_mask(self.width);
+                let mut out_v = Vec::with_capacity(nw);
+                let mut out_x: Option<Vec<u64>> = None;
+                for i in 0..nw {
+                    let mut nv = !val[i] & !xz[i];
+                    let mut nx = xz[i];
+                    if i + 1 == nw {
+                        nv &= top;
+                        nx &= top;
+                    }
+                    out_v.push(nv);
+                    if nx != 0 {
+                        let xbuf = out_x.get_or_insert_with(|| vec![0u64; nw]);
+                        xbuf[i] = nx;
+                    }
+                }
+                let storage = match out_x {
+                    None => ValueStorage::Wide2State(out_v.into_boxed_slice()),
+                    Some(xbuf) => {
+                        let mut combined = Vec::with_capacity(2 * nw);
+                        combined.extend_from_slice(&out_v);
+                        combined.extend_from_slice(&xbuf);
+                        ValueStorage::Wide4State(combined.into_boxed_slice())
+                    }
+                };
+                Value {
+                    storage,
+                    width: self.width,
+                    is_signed: self.is_signed,
+                    is_real: false,
+                    is_fill: false,
+                }
+            }
+            ValueStorage::Bytes(bytes) => {
+                let nw = ValueStorage::wide_nwords(self.width);
+                let top = ValueStorage::top_word_mask(self.width);
+                let mut out = Vec::with_capacity(nw);
+                for i in 0..nw {
+                    let mut nv = !ValueStorage::bytes_word(bytes, i);
+                    if i + 1 == nw {
+                        nv &= top;
+                    }
+                    out.push(nv);
+                }
+                Value {
+                    storage: ValueStorage::Wide2State(out.into_boxed_slice()),
                     width: self.width,
                     is_signed: self.is_signed,
                     is_real: false,
@@ -3074,66 +3952,64 @@ impl Value {
         }
     }
 
-    /// `Some(width)` when both operands are `Wide` buffers of the SAME declared
-    /// width, with at least that many bytes of storage, and a width the
-    /// `MAX_WIDTH` clamp cannot touch. That is exactly the shape for which the
-    /// byte-parallel bitwise path reproduces the `get_bit`/`set_bit` loop
-    /// verbatim: no index reads Zero past a short operand, neither operand is
-    /// narrower than the result, and `Value::zero(w)` would not have clamped.
     #[inline]
     fn wide_bitwise_pair<'v>(
         &'v self,
         other: &'v Value,
-    ) -> Option<(&'v WidePlanes, &'v WidePlanes, usize)> {
+    ) -> Option<((&'v [u64], &'v [u64]), (&'v [u64], &'v [u64]), usize)> {
         if self.width != other.width || self.width <= 64 || self.width > Self::MAX_WIDTH {
             return None;
         }
         let w = self.width as usize;
-        match (&self.storage, &other.storage) {
-            (ValueStorage::Wide(a), ValueStorage::Wide(b)) if a.len() >= w && b.len() >= w => {
-                Some((a, b, w))
-            }
+        let nw = ValueStorage::wide_nwords(self.width);
+        match (self.storage.wide_planes(), other.storage.wide_planes()) {
+            (Some(a), Some(b)) if a.0.len() >= nw && b.0.len() >= nw => Some((a, b, w)),
             _ => None,
         }
     }
 
-    /// Evaluate a 4-state bitwise operator over two `Wide` operands a WORD
-    /// at a time.
-    ///
-    /// Two-plane storage makes this the trivial form: `op_lanes` is the
-    /// operator's truth table as bit-parallel lane algebra over (val, xz)
-    /// planes, and a plane word carries 64 payload bits — so this processes
-    /// 64 bits per iteration where the byte-coded layout managed 8, with no
-    /// unsafe. The `_op_bit` scalar form is retained in the signature so the
-    /// call sites read unchanged; the top word is masked after the loop.
     #[inline(always)]
     fn wide_bitwise_lanes(
-        a: &WidePlanes,
-        b: &WidePlanes,
+        a: (&[u64], &[u64]),
+        b: (&[u64], &[u64]),
         w: usize,
         op_lanes: impl Fn(u64, u64, u64, u64) -> (u64, u64),
         _op_bit: impl Fn(LogicBit, LogicBit) -> LogicBit,
-    ) -> WidePlanes {
-        let mut out = WidePlanes::zeroed(w as u32);
-        let n = out.val.len();
-        for i in 0..n {
-            let (rv, rx) = op_lanes(
-                a.val.get(i).copied().unwrap_or(0),
-                a.xz.get(i).copied().unwrap_or(0),
-                b.val.get(i).copied().unwrap_or(0),
-                b.xz.get(i).copied().unwrap_or(0),
+    ) -> Value {
+        let nw = ValueStorage::wide_nwords(w as u32);
+        let top = ValueStorage::top_word_mask(w as u32);
+        let (av, ax) = a;
+        let (bv, bx) = b;
+        let mut val = vec![0u64; nw];
+        let mut xz: Option<Vec<u64>> = None;
+        for i in 0..nw {
+            let (mut rv, mut rx) = op_lanes(
+                av.get(i).copied().unwrap_or(0),
+                ax.get(i).copied().unwrap_or(0),
+                bv.get(i).copied().unwrap_or(0),
+                bx.get(i).copied().unwrap_or(0),
             );
-            out.val[i] = rv;
-            out.xz[i] = rx;
+            if i + 1 == nw {
+                rv &= top;
+                rx &= top;
+            }
+            val[i] = rv;
+            if rx != 0 {
+                let xbuf = xz.get_or_insert_with(|| vec![0u64; nw]);
+                xbuf[i] = rx;
+            }
         }
-        out.mask_top();
-        out
-    }
-
-    #[inline(always)]
-    fn wide_bitwise_value(bits: WidePlanes, w: usize) -> Value {
+        let storage = match xz {
+            None => ValueStorage::Wide2State(val.into_boxed_slice()),
+            Some(xbuf) => {
+                let mut buf = Vec::with_capacity(2 * nw);
+                buf.extend_from_slice(&val);
+                buf.extend_from_slice(&xbuf);
+                ValueStorage::Wide4State(buf.into_boxed_slice())
+            }
+        };
         Value {
-            storage: ValueStorage::Wide(Box::new(bits)),
+            storage,
             width: w as u32,
             is_signed: false,
             is_real: false,
@@ -3165,7 +4041,7 @@ impl Value {
             return Self::from_f64(if a == other.to_f64() { a } else { 0.0 });
         }
         if let Some((a, b, w)) = self.wide_bitwise_pair(other) {
-            let bits = Self::wide_bitwise_lanes(
+            return Self::wide_bitwise_lanes(
                 a,
                 b,
                 w,
@@ -3175,7 +4051,6 @@ impl Value {
                 },
                 |_, _| unreachable!(),
             );
-            return Self::wide_bitwise_value(bits, w);
         }
         let w = self.width.max(other.width);
         match (&self.storage, &other.storage) {
@@ -3398,17 +4273,16 @@ impl Value {
                 }
             }
             _ => {
-                let mut result = Value::zero(self.width);
-                for i in 0..self.width as usize {
-                    let src = i + amt as usize;
-                    let bit = if src < self.width as usize {
-                        self.get_bit(src)
-                    } else {
-                        sign
-                    };
-                    result.set_bit(i, bit);
+                let mut result = Value {
+                    storage: ValueStorage::wide_filled(self.width, sign),
+                    width: self.width,
+                    is_signed: true,
+                    is_real: false,
+                    is_fill: false,
+                };
+                if amt < self.width {
+                    result.copy_bits_from(0, self, amt as usize, (self.width - amt) as usize);
                 }
-                result.is_signed = true;
                 result
             }
         }
@@ -3570,51 +4444,69 @@ impl Value {
         self.case_eq_slow(other)
     }
 
+    fn case_eq_words(&self, other: &Value, mode: u8) -> Value {
+        if let Some((a, b)) = self.case_fill_pair(other) {
+            return match mode {
+                0 => a.case_eq(&b),
+                1 => a.casez_eq(&b),
+                _ => a.casex_eq(&b),
+            };
+        }
+        let w = self.width.max(other.width) as usize;
+        if w == 0 {
+            return Value::from_u64(1, 1);
+        }
+        let both_signed = self.is_signed && other.is_signed;
+        let ext_of = |v: &Value| -> (u64, u64) {
+            if both_signed && (v.width as usize) < w && v.width > 0 {
+                let c = v.get_bit_code((v.width - 1) as usize);
+                (
+                    0u64.wrapping_sub((c & 1) as u64),
+                    0u64.wrapping_sub(((c >> 1) & 1) as u64),
+                )
+            } else {
+                (0, 0)
+            }
+        };
+        let (a_ext_v, a_ext_x) = ext_of(self);
+        let (b_ext_v, b_ext_x) = ext_of(other);
+        let sw = self.width as usize;
+        let ow = other.width as usize;
+        let slice_ext = |val: &Value, vw: usize, ext_v: u64, ext_x: u64, pos: usize, n: usize, m: u64| {
+            if pos >= vw {
+                (ext_v & m, ext_x & m)
+            } else if pos + n <= vw {
+                val.slice_bits_swar(pos, n)
+            } else {
+                let have = vw - pos;
+                let (sv, sx) = val.slice_bits_swar(pos, have);
+                let hi_mask = m & !((1u64 << have) - 1);
+                (sv | (ext_v & hi_mask), sx | (ext_x & hi_mask))
+            }
+        };
+        let mut pos = 0usize;
+        while pos < w {
+            let n = (w - pos).min(64);
+            let m = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+            let (av, ax) = slice_ext(self, sw, a_ext_v, a_ext_x, pos, n, m);
+            let (bv, bx) = slice_ext(other, ow, b_ext_v, b_ext_x, pos, n, m);
+            let wild = match mode {
+                1 => (av & ax) | (bv & bx),
+                2 => ax | bx,
+                _ => 0,
+            };
+            if (((av ^ bv) | (ax ^ bx)) & !wild & m) != 0 {
+                return Value::from_u64(0, 1);
+            }
+            pos += n;
+        }
+        Value::from_u64(1, 1)
+    }
+
     #[cold]
     #[inline(never)]
     fn case_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.case_fill_pair(other) {
-            return a.case_eq(&b);
-        }
-        // === operator: compares including X/Z. §11.4.5/§11.6.1: operands of
-        // unequal size are extended to the common width; the comparison is
-        // signed (MSB-replicated, including an X/Z MSB) only when BOTH operands
-        // are signed, otherwise zero-extended. Without this a 64-bit signed
-        // value compared to a 32-bit signed `-16` mismatched in the top 32 bits.
-        let w = self.width.max(other.width) as usize;
-        let both_signed = self.is_signed && other.is_signed;
-        let sign_a = both_signed && (self.width as usize) < w;
-        let sign_b = both_signed && (other.width as usize) < w;
-        let top_a = if self.width > 0 {
-            self.get_bit((self.width - 1) as usize)
-        } else {
-            LogicBit::Zero
-        };
-        let top_b = if other.width > 0 {
-            other.get_bit((other.width - 1) as usize)
-        } else {
-            LogicBit::Zero
-        };
-        for i in 0..w {
-            let a = if i < self.width as usize {
-                self.get_bit(i)
-            } else if sign_a {
-                top_a
-            } else {
-                LogicBit::Zero
-            };
-            let b = if i < other.width as usize {
-                other.get_bit(i)
-            } else if sign_b {
-                top_b
-            } else {
-                LogicBit::Zero
-            };
-            if a != b {
-                return Value::from_u64(0, 1);
-            }
-        }
-        Value::from_u64(1, 1)
+        self.case_eq_words(other, 0)
     }
 
     #[inline]
@@ -3644,46 +4536,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn casez_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.case_fill_pair(other) {
-            return a.casez_eq(&b);
-        }
-        let w = self.width.max(other.width) as usize;
-        let both_signed = self.is_signed && other.is_signed;
-        let sign_a = both_signed && (self.width as usize) < w;
-        let sign_b = both_signed && (other.width as usize) < w;
-        let top_a = if self.width > 0 {
-            self.get_bit((self.width - 1) as usize)
-        } else {
-            LogicBit::Zero
-        };
-        let top_b = if other.width > 0 {
-            other.get_bit((other.width - 1) as usize)
-        } else {
-            LogicBit::Zero
-        };
-        for i in 0..w {
-            let a = if i < self.width as usize {
-                self.get_bit(i)
-            } else if sign_a {
-                top_a
-            } else {
-                LogicBit::Zero
-            };
-            let b = if i < other.width as usize {
-                other.get_bit(i)
-            } else if sign_b {
-                top_b
-            } else {
-                LogicBit::Zero
-            };
-            if a == LogicBit::Z || b == LogicBit::Z {
-                continue;
-            }
-            if a != b {
-                return Value::from_u64(0, 1);
-            }
-        }
-        Value::from_u64(1, 1)
+        self.case_eq_words(other, 1)
     }
 
     /// casex wildcard equality: X and Z bits on either side are
@@ -3702,46 +4555,7 @@ impl Value {
     #[cold]
     #[inline(never)]
     fn casex_eq_slow(&self, other: &Value) -> Value {
-        if let Some((a, b)) = self.case_fill_pair(other) {
-            return a.casex_eq(&b);
-        }
-        let w = self.width.max(other.width) as usize;
-        let both_signed = self.is_signed && other.is_signed;
-        let sign_a = both_signed && (self.width as usize) < w;
-        let sign_b = both_signed && (other.width as usize) < w;
-        let top_a = if self.width > 0 {
-            self.get_bit((self.width - 1) as usize)
-        } else {
-            LogicBit::Zero
-        };
-        let top_b = if other.width > 0 {
-            other.get_bit((other.width - 1) as usize)
-        } else {
-            LogicBit::Zero
-        };
-        for i in 0..w {
-            let a = if i < self.width as usize {
-                self.get_bit(i)
-            } else if sign_a {
-                top_a
-            } else {
-                LogicBit::Zero
-            };
-            let b = if i < other.width as usize {
-                other.get_bit(i)
-            } else if sign_b {
-                top_b
-            } else {
-                LogicBit::Zero
-            };
-            if matches!(a, LogicBit::X | LogicBit::Z) || matches!(b, LogicBit::X | LogicBit::Z) {
-                continue;
-            }
-            if a != b {
-                return Value::from_u64(0, 1);
-            }
-        }
-        Value::from_u64(1, 1)
+        self.case_eq_words(other, 2)
     }
 
     /// Shared entry test for the `casez`/`casex` bit-algebra fast paths.
@@ -4029,10 +4843,19 @@ impl Value {
                     Some(false)
                 }
             }
-            ValueStorage::Wide(bits) => {
-                if bits.contains(&LogicBit::One) {
+            ValueStorage::Wide2State(val) => {
+                if val.iter().any(|&w| w != 0) {
                     Some(true)
-                } else if bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)) {
+                } else {
+                    Some(false)
+                }
+            }
+            ValueStorage::Bytes(bytes) => Some(bytes.iter().any(|&b| b != 0)),
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                if val.iter().zip(xz).any(|(&v, &x)| (v & !x) != 0) {
+                    Some(true)
+                } else if xz.iter().any(|&x| x != 0) {
                     None
                 } else {
                     Some(false)
@@ -4046,15 +4869,18 @@ impl Value {
     /// The live (value, xz) plane words of a `Wide` value, LSB word first,
     /// with any bits at or above `nbits` in the top word cleared.
     #[inline]
-    fn wide_words(bits: &WidePlanes) -> impl Iterator<Item = (u64, u64)> + '_ {
-        let n = WidePlanes::nwords(bits.nbits);
-        let r = bits.nbits % 64;
-        let top = if r == 0 { u64::MAX } else { (1u64 << r) - 1 };
+    fn wide_words<'a>(
+        val: &'a [u64],
+        xz: &'a [u64],
+        nbits: u32,
+    ) -> impl Iterator<Item = (u64, u64)> + 'a {
+        let n = ValueStorage::wide_nwords(nbits);
+        let top = ValueStorage::top_word_mask(nbits);
         (0..n).map(move |i| {
             let m = if i + 1 == n { top } else { u64::MAX };
             (
-                bits.val.get(i).copied().unwrap_or(0) & m,
-                bits.xz.get(i).copied().unwrap_or(0) & m,
+                val.get(i).copied().unwrap_or(0) & m,
+                xz.get(i).copied().unwrap_or(0) & m,
             )
         })
     }
@@ -4077,14 +4903,25 @@ impl Value {
                     Value::from_u64(1, 1)
                 }
             }
-            ValueStorage::Wide(bits) => {
+            ValueStorage::Wide2State(val) => {
+                let n = ValueStorage::wide_nwords(self.width);
+                let top = ValueStorage::top_word_mask(self.width);
+                for (i, (v, _)) in Self::wide_words(val, &[], self.width).enumerate() {
+                    let m = if i + 1 == n { top } else { u64::MAX };
+                    if !v & m != 0 {
+                        return Value::from_u64(0, 1);
+                    }
+                }
+                Value::from_u64(1, 1)
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
                 // Word-wise over both planes: a known 0 is `!v & !x` within
                 // the live mask of each word.
-                let n = WidePlanes::nwords(bits.nbits);
-                let r = bits.nbits % 64;
-                let top = if r == 0 { u64::MAX } else { (1u64 << r) - 1 };
+                let n = ValueStorage::wide_nwords(self.width);
+                let top = ValueStorage::top_word_mask(self.width);
                 let mut any_x = false;
-                for (i, (v, x)) in Self::wide_words(bits).enumerate() {
+                for (i, (v, x)) in Self::wide_words(val, xz, self.width).enumerate() {
                     let m = if i + 1 == n { top } else { u64::MAX };
                     if !v & !x & m != 0 {
                         return Value::from_u64(0, 1);
@@ -4094,6 +4931,22 @@ impl Value {
                 if any_x {
                     Value::new(1)
                 } else {
+                    Value::from_u64(1, 1)
+                }
+            }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    Value::from_u64(bytes.iter().all(|&b| b == 0xff) as u64, 1)
+                } else {
+                    let words = ValueStorage::bytes_to_words(bytes, self.width);
+                    let n = ValueStorage::wide_nwords(self.width);
+                    let top = ValueStorage::top_word_mask(self.width);
+                    for (i, (v, _)) in Self::wide_words(&words, &[], self.width).enumerate() {
+                        let m = if i + 1 == n { top } else { u64::MAX };
+                        if !v & m != 0 {
+                            return Value::from_u64(0, 1);
+                        }
+                    }
                     Value::from_u64(1, 1)
                 }
             }
@@ -4113,9 +4966,18 @@ impl Value {
                     Value::from_u64(0, 1)
                 }
             }
-            ValueStorage::Wide(bits) => {
+            ValueStorage::Wide2State(val) => {
+                for (v, _) in Self::wide_words(val, &[], self.width) {
+                    if v != 0 {
+                        return Value::from_u64(1, 1);
+                    }
+                }
+                Value::from_u64(0, 1)
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
                 let mut any_x = false;
-                for (v, x) in Self::wide_words(bits) {
+                for (v, x) in Self::wide_words(val, xz, self.width) {
                     if v & !x != 0 {
                         return Value::from_u64(1, 1);
                     }
@@ -4124,6 +4986,19 @@ impl Value {
                 if any_x {
                     Value::new(1)
                 } else {
+                    Value::from_u64(0, 1)
+                }
+            }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    Value::from_u64(bytes.iter().any(|&b| b != 0) as u64, 1)
+                } else {
+                    let words = ValueStorage::bytes_to_words(bytes, self.width);
+                    for (v, _) in Self::wide_words(&words, &[], self.width) {
+                        if v != 0 {
+                            return Value::from_u64(1, 1);
+                        }
+                    }
                     Value::from_u64(0, 1)
                 }
             }
@@ -4144,21 +5019,197 @@ impl Value {
                     Value::from_u64(((*val_bits & mask).count_ones() & 1) as u64, 1)
                 }
             }
-            ValueStorage::Wide(bits) => Self::reduce_xor_wide(bits),
+            ValueStorage::Wide2State(val) => Self::reduce_xor_wide(val, &[], self.width),
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                Self::reduce_xor_wide(val, xz, self.width)
+            }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    let ones: u32 = bytes.iter().map(|b| b.count_ones()).sum();
+                    Value::from_u64((ones & 1) as u64, 1)
+                } else {
+                    let words = ValueStorage::bytes_to_words(bytes, self.width);
+                    Self::reduce_xor_wide(&words, &[], self.width)
+                }
+            }
         }
     }
 
     // Keep the word loop out of callers that reduce mostly inline values.
     #[inline(never)]
-    fn reduce_xor_wide(bits: &WidePlanes) -> Value {
+    fn reduce_xor_wide(val: &[u64], xz: &[u64], nbits: u32) -> Value {
         let mut ones = 0u32;
-        for (v, x) in Self::wide_words(bits) {
+        for (v, x) in Self::wide_words(val, xz, nbits) {
             if x != 0 {
                 return Value::new(1);
             }
             ones ^= v.count_ones() & 1;
         }
         Value::from_u64(ones as u64, 1)
+    }
+
+    #[inline(always)]
+    fn wire_resolve_word(av: u64, ax: u64, bv: u64, bx: u64) -> (u64, u64) {
+        let az = av & ax;
+        let bz = bv & bx;
+        let ov = (az & bv) | (bz & av) | ((av & !ax) & (bv & !bx));
+        let ox = (az & bx) | (bz & ax) | ((!az) & (!bz) & (ax | bx | (av ^ bv)));
+        (ov, ox)
+    }
+
+    #[inline(always)]
+    fn wired_logic_word(av: u64, ax: u64, bv: u64, bx: u64, is_and: bool) -> (u64, u64) {
+        let (rv, rx) = Self::wire_resolve_word(av, ax, bv, bx);
+        if is_and {
+            let ctrl = ((!av) & (!ax)) | ((!bv) & (!bx));
+            (rv & !ctrl, rx & !ctrl)
+        } else {
+            let ctrl = (av & (!ax)) | (bv & (!bx));
+            (rv | ctrl, rx & !ctrl)
+        }
+    }
+
+    #[inline(always)]
+    fn wire_resolve_pull_word(sv: u64, sx: u64, wv: u64, wx: u64) -> (u64, u64) {
+        let sz = sv & sx;
+        ((sz & wv) | ((!sz) & sv), (sz & wx) | ((!sz) & sx))
+    }
+
+    #[inline(always)]
+    fn tranif_uncertain_word(mv: u64, mx: u64, ov: u64, ox: u64) -> (u64, u64) {
+        let same = !(mv ^ ov) & !(mx ^ ox);
+        (same & mv, (same & mx) | !same)
+    }
+
+    #[inline(always)]
+    fn word_planes_zero_padded(&self, wi: usize, target_w: u32) -> (u64, u64) {
+        if self.is_fill && self.width > 0 {
+            let (v, x) = match self.get_bit(0) {
+                LogicBit::Zero => (0u64, 0u64),
+                LogicBit::One => (u64::MAX, 0u64),
+                LogicBit::X => (0u64, u64::MAX),
+                LogicBit::Z => (u64::MAX, u64::MAX),
+            };
+            let bits_left = (target_w as usize).saturating_sub(wi * 64);
+            let mask = if bits_left >= 64 {
+                u64::MAX
+            } else if bits_left == 0 {
+                0
+            } else {
+                (1u64 << bits_left) - 1
+            };
+            return (v & mask, x & mask);
+        }
+        let valid_bits = (self.width as usize).saturating_sub(wi * 64);
+        if valid_bits == 0 {
+            return (0, 0);
+        }
+        let mask = if valid_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid_bits) - 1
+        };
+        let (v, x) = match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if wi == 0 {
+                    (*val_bits, *xz_bits)
+                } else {
+                    (0, 0)
+                }
+            }
+            ValueStorage::Wide2State(val) => (val.get(wi).copied().unwrap_or(0), 0),
+            ValueStorage::Wide4State(buf) => {
+                let n = buf.len() / 2;
+                (
+                    buf[..n].get(wi).copied().unwrap_or(0),
+                    buf[n..].get(wi).copied().unwrap_or(0),
+                )
+            }
+            ValueStorage::Bytes(bytes) => (ValueStorage::bytes_word(bytes, wi), 0),
+        };
+        (v & mask, x & mask)
+    }
+
+    #[inline]
+    fn binary_4state_word_op(
+        &self,
+        other: &Value,
+        op: impl Fn(u64, u64, u64, u64) -> (u64, u64),
+    ) -> Value {
+        let w = self.width.max(other.width).max(1);
+        if w <= 64 {
+            let (av, ax) = self.word_planes_zero_padded(0, w);
+            let (bv, bx) = other.word_planes_zero_padded(0, w);
+            let (rv, rx) = op(av, ax, bv, bx);
+            let mask = Self::mask(w);
+            return Value {
+                storage: ValueStorage::Inline {
+                    val_bits: rv & mask,
+                    xz_bits: rx & mask,
+                },
+                width: w,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            };
+        }
+        let nw = ValueStorage::wide_nwords(w);
+        let top = ValueStorage::top_word_mask(w);
+        let mut val = vec![0u64; nw];
+        let mut xz: Option<Vec<u64>> = None;
+        for (wi, vslot) in val.iter_mut().enumerate() {
+            let (av, ax) = self.word_planes_zero_padded(wi, w);
+            let (bv, bx) = other.word_planes_zero_padded(wi, w);
+            let (mut rv, mut rx) = op(av, ax, bv, bx);
+            if wi + 1 == nw {
+                rv &= top;
+                rx &= top;
+            }
+            *vslot = rv;
+            if rx != 0 {
+                let xbuf = xz.get_or_insert_with(|| vec![0u64; nw]);
+                xbuf[wi] = rx;
+            }
+        }
+        let storage = match xz {
+            None => ValueStorage::Wide2State(val.into_boxed_slice()),
+            Some(xbuf) => {
+                let mut combined = Vec::with_capacity(2 * nw);
+                combined.extend_from_slice(&val);
+                combined.extend_from_slice(&xbuf);
+                ValueStorage::Wide4State(combined.into_boxed_slice())
+            }
+        };
+        Value {
+            storage,
+            width: w,
+            is_signed: false,
+            is_real: false,
+            is_fill: false,
+        }
+    }
+
+    /// Word-parallel IEEE 1800 wired-net (`wire`/`tri`) resolution across two drivers.
+    pub fn wire_resolve(&self, other: &Value) -> Value {
+        self.binary_4state_word_op(other, Self::wire_resolve_word)
+    }
+
+    /// Word-parallel IEEE 1800 §6.6.2 wired-AND (`wand`) / wired-OR (`wor`) resolution.
+    pub fn wired_logic(&self, other: &Value, is_and: bool) -> Value {
+        self.binary_4state_word_op(other, |av, ax, bv, bx| {
+            Self::wired_logic_word(av, ax, bv, bx, is_and)
+        })
+    }
+
+    /// Word-parallel strong-over-weak resolution: `weak` fills only `z` bits of `self`.
+    pub fn wire_resolve_pull(&self, weak: &Value) -> Value {
+        self.binary_4state_word_op(weak, Self::wire_resolve_pull_word)
+    }
+
+    /// Word-parallel unknown-control switch resolution: agreeing bits pass, differing become `x`.
+    pub fn tranif_uncertain(&self, other: &Value) -> Value {
+        self.binary_4state_word_op(other, Self::tranif_uncertain_word)
     }
 
     // === Concatenation ===
@@ -4231,7 +5282,13 @@ impl Value {
         // one `splice64` per ≤64-bit run of each operand, no unsafe.
         let total = total_width as usize;
         let capped = Self::cap_width(total_width) as usize;
-        let mut out = WidePlanes::zeroed(capped as u32);
+        let any_xz = values.clone().any(|v| v.has_xz());
+        let mut storage = if any_xz {
+            let nw = ValueStorage::wide_nwords(capped as u32);
+            ValueStorage::Wide4State(vec![0u64; 2 * nw].into_boxed_slice())
+        } else {
+            ValueStorage::wide_zeroed(capped as u32)
+        };
         let clamped = capped != total;
         let mut len = 0usize;
         for val in values.rev() {
@@ -4247,17 +5304,33 @@ impl Value {
             }
             match &val.storage {
                 ValueStorage::Inline { val_bits, xz_bits } => {
-                    out.splice64(len, *val_bits, *xz_bits, take.min(64));
-                    // An Inline storage declared wider than 64 keeps the
-                    // pre-existing get_bit behaviour (reads Zero) — the
-                    // zeroed planes already hold that.
+                    storage.wide_splice64(capped as u32, len, *val_bits, *xz_bits, take.min(64));
                 }
-                ValueStorage::Wide(bits) => {
+                ValueStorage::Wide2State(src) => {
                     let mut j = 0usize;
                     while j < take {
                         let n = (take - j).min(64);
-                        let (v, x) = bits.extract64(j, n);
-                        out.splice64(len + j, v, x, n);
+                        let (v, _) = ValueStorage::wide_extract64(src, &[], val.width, j, n);
+                        storage.wide_splice64(capped as u32, len + j, v, 0, n);
+                        j += n;
+                    }
+                }
+                ValueStorage::Wide4State(buf) => {
+                    let (src_v, src_x) = buf.split_at(buf.len() / 2);
+                    let mut j = 0usize;
+                    while j < take {
+                        let n = (take - j).min(64);
+                        let (v, x) = ValueStorage::wide_extract64(src_v, src_x, val.width, j, n);
+                        storage.wide_splice64(capped as u32, len + j, v, x, n);
+                        j += n;
+                    }
+                }
+                ValueStorage::Bytes(bytes) => {
+                    let mut j = 0usize;
+                    while j < take {
+                        let n = (take - j).min(64);
+                        let (v, _) = ValueStorage::bytes_slice64(bytes, val.width, j, n);
+                        storage.wide_splice64(capped as u32, len + j, v, 0, n);
                         j += n;
                     }
                 }
@@ -4265,7 +5338,7 @@ impl Value {
             len += take;
         }
         Value {
-            storage: ValueStorage::Wide(Box::new(out)),
+            storage,
             width: capped as u32,
             is_signed: false,
             is_real: false,
@@ -5880,30 +6953,13 @@ impl Value {
     /// Check if the value has any unknown (X/Z) bits
     #[inline]
     pub fn has_unknown(&self) -> bool {
-        match &self.storage {
-            ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
-            // A word scan of the xz plane; the per-bit iterator walk was
-            // 1.9 % of a c906 run (every wide two-state guard asks this).
-            ValueStorage::Wide(bits) => bits.xz.iter().any(|w| *w != 0),
-        }
+        self.has_xz()
     }
 
     /// Create a value with all bits set to 1
     #[inline]
     pub fn ones(width: u32) -> Self {
-        let width = Self::cap_width(width);
-        if width <= 64 {
-            Self::from_u64(Self::mask(width), width)
-        } else {
-            let bits = vec![LogicBit::One; width as usize];
-            Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::from_bits(&bits))),
-                width,
-                is_signed: false,
-                is_real: false,
-                is_fill: false,
-            }
-        }
+        Self::all_ones(width)
     }
 
     /// Decimal string representation
@@ -5999,23 +7055,244 @@ impl Value {
         s
     }
 
+    #[inline]
+    fn sv_byte_at(&self, bi: usize) -> u8 {
+        let num_bytes = self.width.div_ceil(8) as usize;
+        if bi >= num_bytes {
+            return 0;
+        }
+        let w = core::cmp::min(8, self.width as usize - bi * 8);
+        let mask = if w == 8 { 0xffu64 } else { (1u64 << w) - 1 };
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let lo = bi * 8;
+                let v = (val_bits >> lo) & mask;
+                let x = (xz_bits >> lo) & mask;
+                ((v & !x) & 0xff) as u8
+            }
+            ValueStorage::Wide2State(val) => {
+                let word = bi / 8;
+                let shift = (bi % 8) * 8;
+                let v = (val[word] >> shift) & mask;
+                (v & 0xff) as u8
+            }
+            ValueStorage::Wide4State(buf) => {
+                let (val, xz) = buf.split_at(buf.len() / 2);
+                let word = bi / 8;
+                let shift = (bi % 8) * 8;
+                let v = (val[word] >> shift) & mask;
+                let x = (xz[word] >> shift) & mask;
+                ((v & !x) & 0xff) as u8
+            }
+            ValueStorage::Bytes(bytes) => {
+                if self.width as usize == bytes.len() * 8 {
+                    bytes[bytes.len() - 1 - bi]
+                } else {
+                    let word = bi / 8;
+                    let shift = (bi % 8) * 8;
+                    let v = (ValueStorage::bytes_word(bytes, word) >> shift) & mask;
+                    (v & 0xff) as u8
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn sv_content_byte_range(&self) -> usize {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let skip = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            return bytes.len() - skip;
+        }
+        let num_bytes = self.width.div_ceil(8) as usize;
+        for bi in (0..num_bytes).rev() {
+            if self.sv_byte_at(bi) != 0 {
+                return bi + 1;
+            }
+        }
+        0
+    }
+
+    /// Zero-allocation byte length of a SystemVerilog string `Value`
+    /// (identical to `self.sv_string_bytes().len()`).
+    #[inline]
+    pub fn sv_string_len(&self) -> usize {
+        self.sv_content_byte_range()
+    }
+
+    /// Zero-allocation character read at index `idx` (`0` = leftmost byte);
+    /// returns `0` when out of bounds.
+    #[inline]
+    pub fn sv_string_getc(&self, idx: usize) -> u8 {
+        let len = self.sv_content_byte_range();
+        if idx >= len {
+            0
+        } else {
+            self.sv_byte_at(len - 1 - idx)
+        }
+    }
+
+    /// Zero-allocation lexicographic byte comparison matching `Simulator::sv_strcmp`.
+    pub fn sv_string_cmp(&self, other: &Self, icase: bool) -> i64 {
+        if let (ValueStorage::Bytes(ab), ValueStorage::Bytes(bb)) = (&self.storage, &other.storage)
+            && self.width as usize == ab.len() * 8
+            && other.width as usize == bb.len() * 8
+        {
+            if Arc::ptr_eq(ab, bb) {
+                return 0;
+            }
+            let a_skip = ab.iter().position(|&b| b != 0).unwrap_or(ab.len());
+            let b_skip = bb.iter().position(|&b| b != 0).unwrap_or(bb.len());
+            let a = &ab[a_skip..];
+            let b = &bb[b_skip..];
+            if !icase {
+                for (&ba, &bb) in a.iter().zip(b.iter()) {
+                    if ba != bb {
+                        return i64::from(ba) - i64::from(bb);
+                    }
+                }
+            } else {
+                for (&ba, &bb) in a.iter().zip(b.iter()) {
+                    let ca = ba.to_ascii_lowercase();
+                    let cb = bb.to_ascii_lowercase();
+                    if ca != cb {
+                        return i64::from(ca) - i64::from(cb);
+                    }
+                }
+            }
+            return match a.len().cmp(&b.len()) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+        }
+        let la = self.sv_content_byte_range();
+        let lb = other.sv_content_byte_range();
+        let n = la.min(lb);
+        for i in 0..n {
+            let mut ba = self.sv_byte_at(la - 1 - i);
+            let mut bb = other.sv_byte_at(lb - 1 - i);
+            if icase {
+                ba = ba.to_ascii_lowercase();
+                bb = bb.to_ascii_lowercase();
+            }
+            if ba != bb {
+                return i64::from(ba) - i64::from(bb);
+            }
+        }
+        match la.cmp(&lb) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
+    }
+
+    /// Inclusive substring `[start..=end]` as a string `Value`, or empty `""`
+    /// (`Value::zero(0)`) if `start > end` or `end >= len`.
+    pub fn sv_string_slice(&self, start: usize, end: usize) -> Self {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let skip = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            let content = &bytes[skip..];
+            if content.is_empty() || start > end || end >= content.len() {
+                return Self::zero(0);
+            }
+            if start == 0 && end + 1 == content.len() && skip == 0 {
+                let mut r = self.clone();
+                r.is_signed = false;
+                return r;
+            }
+            return Self::from_bytes(&content[start..=end]);
+        }
+        let len = self.sv_content_byte_range();
+        if len == 0 || start > end || end >= len {
+            return Self::zero(0);
+        }
+        if !self.has_xz() && self.width as usize == len * 8 {
+            let mut r = self.range_select((len - 1 - start) * 8 + 7, (len - 1 - end) * 8);
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = Vec::with_capacity(end - start + 1);
+        for idx in start..=end {
+            out.push(self.sv_byte_at(len - 1 - idx));
+        }
+        Self::from_bytes(&out)
+    }
+
+    /// Convert a literal or integral `Value` to `string` by stripping all
+    /// NUL (`\0`) bytes (§6.16). Zero-allocates when clean and NUL-free.
+    pub fn sv_string_strip_nul(&self) -> Self {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            if !bytes.contains(&0) {
+                let mut r = self.clone();
+                r.is_signed = false;
+                return r;
+            }
+            let stripped: Vec<u8> = bytes.iter().copied().filter(|&b| b != 0).collect();
+            return Self::from_bytes(&stripped);
+        }
+        let len = self.sv_content_byte_range();
+        if len == 0 {
+            return Self::zero(0);
+        }
+        if !self.has_xz()
+            && self.width as usize == len * 8
+            && (0..len).all(|bi| self.sv_byte_at(bi) != 0)
+        {
+            let mut r = self.clone();
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = Vec::with_capacity(len);
+        for bi in (0..len).rev() {
+            let b = self.sv_byte_at(bi);
+            if b != 0 {
+                out.push(b);
+            }
+        }
+        Self::from_bytes(&out)
+    }
+
+    /// Zero-copy borrow of big-endian string content bytes (leading widening
+    /// NULs trimmed) when backed by `ValueStorage::Bytes`.
+    pub fn sv_string_bytes_cow(&self) -> std::borrow::Cow<'_, [u8]> {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            return std::borrow::Cow::Borrowed(&bytes[start..]);
+        }
+        std::borrow::Cow::Owned(self.sv_string_bytes())
+    }
+
     /// The value's bytes as string content, big-endian (MSB first), with the
     /// LEADING NUL bytes introduced by widening trimmed. Zero bytes at or
     /// below the first nonzero byte are kept: they are genuine content —
     /// §21.2.1.4 unformatted `%u`/`%z` dumps end in alignment NULs that
     /// `len()`/`getc()` must observe.
     pub fn sv_string_bytes(&self) -> Vec<u8> {
+        if let ValueStorage::Bytes(bytes) = &self.storage
+            && self.width as usize == bytes.len() * 8
+        {
+            let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+            return bytes[start..].to_vec();
+        }
         let num_bytes = self.width.div_ceil(8) as usize;
         let mut out: Vec<u8> = Vec::with_capacity(num_bytes);
         let mut started = false;
         // String values carry no X/Z bits: read each byte straight from its
         // value word. String building (`s = {s, x}`) converts the whole
         // accumulated value on every append, so this runs per character.
-        if let ValueStorage::Wide(planes) = &self.storage
-            && planes.xz.iter().all(|&w| w == 0)
+        if let Some((val, xz)) = self.storage.wide_planes()
+            && xz.iter().all(|&w| w == 0)
         {
             for bi in (0..num_bytes).rev() {
-                let mut byte = (planes.val[bi / 8] >> ((bi % 8) * 8)) as u8;
+                let mut byte = (val[bi / 8] >> ((bi % 8) * 8)) as u8;
                 let w = self.width as usize - bi * 8;
                 if w < 8 {
                     byte &= ((1u16 << w) - 1) as u8;
@@ -6053,12 +7330,104 @@ impl Value {
     /// to one char (Latin-1, the inverse of `from_string`), so raw bytes
     /// above 0x7F survive a round-trip instead of becoming U+FFFD.
     pub fn to_sv_string(&self) -> String {
-        let bytes = self.sv_string_bytes();
+        let bytes = self.sv_string_bytes_cow();
         if bytes.is_ascii() {
             // ASCII is already valid UTF-8 with one byte per char.
-            return String::from_utf8(bytes).unwrap_or_default();
+            return match bytes {
+                std::borrow::Cow::Borrowed(sl) => {
+                    String::from_utf8_lossy(sl).into_owned()
+                }
+                std::borrow::Cow::Owned(v) => String::from_utf8(v).unwrap_or_default(),
+            };
         }
-        bytes.into_iter().map(|b| b as char).collect()
+        bytes.iter().map(|&b| b as char).collect()
+    }
+
+    /// §6.16.4/§6.16.5 `toupper`/`tolower` directly over SV string bytes
+    /// without building an intermediate `String`. Returns a ref-counted clone
+    /// when already normalized as `Bytes`.
+    pub fn sv_string_ascii_case(&self, upper: bool) -> Self {
+        let bytes = self.sv_string_bytes_cow();
+        let convert = |b: u8| if upper { b.to_ascii_uppercase() } else { b.to_ascii_lowercase() };
+        if matches!(self.storage, ValueStorage::Bytes(_))
+            && bytes.len() * 8 == self.width as usize
+            && bytes.iter().all(|&b| convert(b) == b)
+        {
+            let mut r = self.clone();
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = Vec::with_capacity(bytes.len());
+        out.extend(bytes.iter().map(|&b| convert(b)));
+        Self::from_bytes(&out)
+    }
+
+    /// §6.16.4 `s.putc(idx, ch)` returning the updated string `Value`
+    /// (`self.clone()` on out-of-range index or NUL `ch`).
+    pub fn sv_string_putc(&self, idx: i64, ch: u8) -> Self {
+        let bytes = self.sv_string_bytes_cow();
+        if idx < 0 || (idx as usize) >= bytes.len() || ch == 0 {
+            return self.clone();
+        }
+        let i = idx as usize;
+        if bytes[i] == ch
+            && matches!(self.storage, ValueStorage::Bytes(_))
+            && bytes.len() * 8 == self.width as usize
+        {
+            let mut r = self.clone();
+            r.is_signed = false;
+            return r;
+        }
+        let mut out = bytes.into_owned();
+        out[i] = ch;
+        Self::from_bytes(&out)
+    }
+
+    /// In-place `putc` optimization: updates the `Arc<[u8]>` buffer directly
+    /// without allocating when uniquely owned (`Arc::get_mut`) and free of
+    /// leading widening NULs. Returns `true` if modified.
+    pub fn sv_string_putc_in_place(&mut self, idx: i64, ch: u8) -> bool {
+        if idx < 0 || ch == 0 {
+            return false;
+        }
+        let i = idx as usize;
+        if let ValueStorage::Bytes(ref mut arc) = self.storage
+            && self.width as usize == arc.len() * 8
+            && arc.first().copied() != Some(0)
+        {
+            if i >= arc.len() {
+                return false;
+            }
+            if arc[i] == ch {
+                self.is_signed = false;
+                return true;
+            }
+            if let Some(slice) = Arc::get_mut(arc) {
+                slice[i] = ch;
+                self.is_signed = false;
+                return true;
+            }
+        }
+        let next = self.sv_string_putc(idx, ch);
+        let len = self.sv_content_byte_range();
+        if i >= len {
+            return false;
+        }
+        *self = next;
+        true
+    }
+
+    /// Concatenate SV string parts into a single `string` `Value` using one
+    /// buffer allocation (`sv_string_bytes_cow` avoids per-operand `Vec<u8>`).
+    pub fn sv_string_concat_refs<'a, I>(parts: I) -> Self
+    where
+        I: IntoIterator<Item = &'a Value>,
+    {
+        let mut out: Vec<u8> = Vec::new();
+        for part in parts {
+            out.extend_from_slice(&part.sv_string_bytes_cow());
+        }
+        Self::from_bytes(&out)
     }
 
     /// Hex string representation
@@ -6303,7 +7672,7 @@ impl Value {
         // limbs = limbs * 10 + digit. The limb vector is sized to `width`, so
         // a carry out of the top word is the truncation and is dropped, and a
         // forty-digit literal costs no more than a short one.
-        let mut limbs = vec![0u64; WidePlanes::nwords(width)];
+        let mut limbs = vec![0u64; ValueStorage::wide_nwords(width)];
         for b in digits.bytes() {
             let mut carry = 0u64;
             for w in limbs.iter_mut() {
@@ -6322,10 +7691,9 @@ impl Value {
                 }
             }
         }
-        // Mirror the storage split every other constructor makes: an
-        // `Inline` and a `Wide` holding the same bits are never `==`.
+        let storage = ValueStorage::wide_from_val_words(&limbs, width);
         Value {
-            storage: ValueStorage::Wide(Box::new(WidePlanes::from_val_words(&limbs, width))),
+            storage,
             width,
             is_signed: false,
             is_real: false,
@@ -6359,26 +7727,50 @@ impl Value {
                     };
                 }
             }
-            // `Wide` storage is one byte per bit and `LogicBit`'s discriminant
-            // IS the `(xz << 1) | val` code, so an in-range select is a byte
-            // load and two masks — the same result `bit_select_slow` produced,
-            // without the out-of-line call. `index < self.width` rules out
-            // §11.5.1's x-on-overrun, and a short buffer still falls through.
-            ValueStorage::Wide(bits) => {
+            ValueStorage::Wide2State(val) => {
                 if index < self.width as usize {
-                    {
-                        let code = bits.get(index) as u64;
-                        return Value {
-                            storage: ValueStorage::Inline {
-                                val_bits: code & 1,
-                                xz_bits: (code >> 1) & 1,
-                            },
-                            width: 1,
-                            is_signed: false,
-                            is_real: false,
-                            is_fill: false,
-                        };
-                    }
+                    let code = ValueStorage::wide_get(val, &[], index) as u64;
+                    return Value {
+                        storage: ValueStorage::Inline {
+                            val_bits: code & 1,
+                            xz_bits: (code >> 1) & 1,
+                        },
+                        width: 1,
+                        is_signed: false,
+                        is_real: false,
+                        is_fill: false,
+                    };
+                }
+            }
+            ValueStorage::Wide4State(buf) => {
+                if index < self.width as usize {
+                    let (val, xz) = buf.split_at(buf.len() / 2);
+                    let code = ValueStorage::wide_get(val, xz, index) as u64;
+                    return Value {
+                        storage: ValueStorage::Inline {
+                            val_bits: code & 1,
+                            xz_bits: (code >> 1) & 1,
+                        },
+                        width: 1,
+                        is_signed: false,
+                        is_real: false,
+                        is_fill: false,
+                    };
+                }
+            }
+            ValueStorage::Bytes(bytes) => {
+                if index < self.width as usize {
+                    let bit = ValueStorage::bytes_get_code(bytes, index) as u64;
+                    return Value {
+                        storage: ValueStorage::Inline {
+                            val_bits: bit,
+                            xz_bits: 0,
+                        },
+                        width: 1,
+                        is_signed: false,
+                        is_real: false,
+                        is_fill: false,
+                    };
                 }
             }
         }
@@ -6526,7 +7918,20 @@ impl Value {
                     (*val_bits >> (src_start + offset)),
                     (*xz_bits >> (src_start + offset)),
                 ),
-                ValueStorage::Wide(bits) => bits.extract64(src_start + offset, count),
+                ValueStorage::Wide2State(val) => ValueStorage::wide_extract64(
+                    val,
+                    &[],
+                    self.width,
+                    src_start + offset,
+                    count,
+                ),
+                ValueStorage::Wide4State(buf) => {
+                    let (val, xz) = buf.split_at(buf.len() / 2);
+                    ValueStorage::wide_extract64(val, xz, self.width, src_start + offset, count)
+                }
+                ValueStorage::Bytes(bytes) => {
+                    ValueStorage::bytes_slice64(bytes, self.width, src_start + offset, count)
+                }
             };
             result.splice_bits64(dst_start + offset, val_bits, xz_bits, count);
         }
@@ -6587,34 +7992,98 @@ impl Value {
         // c906 hello showed Wide→Inline range_select dominating after the
         // Inline→Inline fast path landed (set_bit fan-out was ~40% of
         // range_select self-time on its own).
-        if let ValueStorage::Wide(bits) = &self.storage {
-            // Wide → Wide fast path for width > 64: replace the per-bit
-            // get_bit/set_bit loop with a single slice copy. The source
-            // already stores `Vec<LogicBit>` (1 byte per bit) so the copy
-            // is just a memcpy.
+        if let ValueStorage::Bytes(bytes) = &self.storage {
+            if width <= 64 {
+                let (val_bits, xz_bits) =
+                    ValueStorage::bytes_slice64(bytes, self.width, lo, width);
+                return Value {
+                    storage: ValueStorage::Inline { val_bits, xz_bits },
+                    width: width as u32,
+                    is_signed: false,
+                    is_real: false,
+                    is_fill: false,
+                };
+            }
+            if lo % 8 == 0
+                && width % 8 == 0
+                && lo + width <= self.width as usize
+                && self.width as usize == bytes.len() * 8
+            {
+                let end_byte = bytes.len() - lo / 8;
+                let start_byte = bytes.len() - (lo + width) / 8;
+                return Self::from_bytes(&bytes[start_byte..end_byte]);
+            }
+            let n = ValueStorage::wide_nwords(width as u32);
+            let top = ValueStorage::top_word_mask(width as u32);
+            let (wi0, off) = (lo / 64, lo % 64);
+            let mut val = vec![0u64; n].into_boxed_slice();
+            for (wi, d) in val.iter_mut().enumerate() {
+                let lo64 = ValueStorage::bytes_word(bytes, wi0 + wi) >> off;
+                let hi64 = if off > 0 {
+                    ValueStorage::bytes_word(bytes, wi0 + wi + 1) << (64 - off)
+                } else {
+                    0
+                };
+                *d = lo64 | hi64;
+            }
+            val[n - 1] &= top;
+            return Value {
+                storage: ValueStorage::Wide2State(val),
+                width: width as u32,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            };
+        }
+        if let Some((sv_p, sx_p)) = self.storage.wide_planes() {
             if width > 64 {
-                // Plane shift-copy: each destination word gathers from the
-                // (at most two) source words it straddles; out-of-range
-                // source words read 0, matching get_bit's Zero.
-                let mut out = WidePlanes::zeroed(width as u32);
+                let n = ValueStorage::wide_nwords(width as u32);
+                let top = ValueStorage::top_word_mask(width as u32);
                 let (wi0, off) = (lo / 64, lo % 64);
-                let n = out.val.len();
-                for wi in 0..n {
-                    let take = |plane: &[u64]| -> u64 {
+                let extract_plane = |plane: &[u64], dst: &mut [u64]| {
+                    for (wi, d) in dst.iter_mut().enumerate() {
                         let lo64 = plane.get(wi0 + wi).copied().unwrap_or(0) >> off;
                         let hi64 = if off > 0 {
                             plane.get(wi0 + wi + 1).copied().unwrap_or(0) << (64 - off)
                         } else {
                             0
                         };
-                        lo64 | hi64
-                    };
-                    out.val[wi] = take(&bits.val);
-                    out.xz[wi] = take(&bits.xz);
-                }
-                out.mask_top();
+                        *d = lo64 | hi64;
+                    }
+                    dst[n - 1] &= top;
+                };
+                let any_xz = if sx_p.is_empty() {
+                    false
+                } else {
+                    let mut src_any = false;
+                    for wi in 0..n {
+                        let lo64 = sx_p.get(wi0 + wi).copied().unwrap_or(0) >> off;
+                        let hi64 = if off > 0 {
+                            sx_p.get(wi0 + wi + 1).copied().unwrap_or(0) << (64 - off)
+                        } else {
+                            0
+                        };
+                        let w = if wi + 1 == n { (lo64 | hi64) & top } else { lo64 | hi64 };
+                        if w != 0 {
+                            src_any = true;
+                            break;
+                        }
+                    }
+                    src_any
+                };
+                let storage = if !any_xz {
+                    let mut val = vec![0u64; n].into_boxed_slice();
+                    extract_plane(sv_p, &mut val);
+                    ValueStorage::Wide2State(val)
+                } else {
+                    let mut buf = vec![0u64; 2 * n].into_boxed_slice();
+                    let (val, xz) = buf.split_at_mut(n);
+                    extract_plane(sv_p, val);
+                    extract_plane(sx_p, xz);
+                    ValueStorage::Wide4State(buf)
+                };
                 return Value {
-                    storage: ValueStorage::Wide(Box::new(out)),
+                    storage,
                     width: width as u32,
                     is_signed: false,
                     is_real: false,
@@ -6622,24 +8091,8 @@ impl Value {
                 };
             }
             if width <= 64 {
-                // Plane extraction, same shape as slice_bits_swar.
-                let mask = if width >= 64 {
-                    u64::MAX
-                } else {
-                    (1u64 << width) - 1
-                };
-                let (wi, off) = (lo / 64, lo % 64);
-                let take = |plane: &[u64]| -> u64 {
-                    let lo64 = plane.get(wi).copied().unwrap_or(0) >> off;
-                    let hi64 = if off > 0 {
-                        plane.get(wi + 1).copied().unwrap_or(0) << (64 - off)
-                    } else {
-                        0
-                    };
-                    (lo64 | hi64) & mask
-                };
-                let val_bits = take(&bits.val);
-                let xz_bits = take(&bits.xz);
+                let (val_bits, xz_bits) =
+                    ValueStorage::wide_extract64(sv_p, sx_p, self.width, lo, width);
                 return Value {
                     storage: ValueStorage::Inline { val_bits, xz_bits },
                     width: width as u32,
@@ -6712,19 +8165,32 @@ impl Value {
                 *sv = *ov;
                 *sx = *ox;
             }
-            (ValueStorage::Wide(sv), ValueStorage::Wide(ov)) => {
-                // Equal lengths (the norm — a signal keeps its width) copy
-                // straight over the existing buffer: one memcpy, no length
-                // store, no capacity check, and no `RawVec::grow` call kept
-                // alive on the path. Only a genuine width change needs the
-                // clear + reserve + extend dance.
-                if sv.nbits == ov.nbits {
-                    sv.val.copy_from_slice(&ov.val);
-                    sv.xz.copy_from_slice(&ov.xz);
+            (ValueStorage::Wide2State(sv), ValueStorage::Wide2State(ov)) if sv.len() == ov.len() => {
+                sv.copy_from_slice(ov);
+            }
+            (ValueStorage::Wide4State(sv), ValueStorage::Wide2State(ov))
+                if sv.len() == ov.len() * 2 =>
+            {
+                let (dval, dxz) = sv.split_at_mut(ov.len());
+                dval.copy_from_slice(ov);
+                dxz.fill(0);
+            }
+            (ValueStorage::Wide4State(sv), ValueStorage::Wide4State(ov))
+                if sv.len() == ov.len() =>
+            {
+                sv.copy_from_slice(ov);
+            }
+            (ValueStorage::Wide2State(sv), ValueStorage::Wide4State(ov))
+                if ov.len() == sv.len() * 2 =>
+            {
+                let (oval, oxz) = ov.split_at(sv.len());
+                if oxz.iter().all(|&x| x == 0) {
+                    sv.copy_from_slice(oval);
                 } else {
-                    **sv = (**ov).clone();
+                    self.storage = other.storage.clone();
                 }
             }
+            (ValueStorage::Bytes(sa), ValueStorage::Bytes(oa)) if Arc::ptr_eq(sa, oa) => {}
             _ => {
                 self.storage = other.storage.clone();
             }
@@ -6803,7 +8269,7 @@ impl Value {
             }
         } else {
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::filled(width, LogicBit::X))),
+                storage: ValueStorage::wide_filled(width, LogicBit::X),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -6829,7 +8295,7 @@ impl Value {
             }
         } else {
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::filled(width, LogicBit::One))),
+                storage: ValueStorage::wide_filled(width, LogicBit::One),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -6859,19 +8325,46 @@ impl Value {
                     _ => None,
                 }
             }
-            ValueStorage::Wide(planes) => {
-                if planes.nbits != self.width
-                    || planes.val.is_empty()
-                    || planes.val.len() != planes.xz.len()
-                    || planes.val.len() != WidePlanes::nwords(self.width)
-                {
+            ValueStorage::Wide2State(val) => {
+                let n = ValueStorage::wide_nwords(self.width);
+                if val.len() != n {
                     return None;
                 }
-                let last = planes.val.len() - 1;
-                let rem = self.width % 64;
-                let top_mask = if rem == 0 { u64::MAX } else { (1u64 << rem) - 1 };
+                let last = n - 1;
+                let top_mask = ValueStorage::top_word_mask(self.width);
+                let (bit, v_word) = if last == 0 {
+                    match val[0] {
+                        0 => (LogicBit::Zero, 0),
+                        v if v == top_mask => (LogicBit::One, u64::MAX),
+                        _ => return None,
+                    }
+                } else {
+                    match val[0] {
+                        0 => (LogicBit::Zero, 0),
+                        u64::MAX => (LogicBit::One, u64::MAX),
+                        _ => return None,
+                    }
+                };
+                for &w in &val[1..last] {
+                    if w != v_word {
+                        return None;
+                    }
+                }
+                if val[last] != (v_word & top_mask) {
+                    return None;
+                }
+                Some(bit)
+            }
+            ValueStorage::Wide4State(buf) => {
+                let n = ValueStorage::wide_nwords(self.width);
+                if buf.len() != 2 * n {
+                    return None;
+                }
+                let (val, xz) = buf.split_at(n);
+                let last = n - 1;
+                let top_mask = ValueStorage::top_word_mask(self.width);
                 let (bit, v_word, x_word) = if last == 0 {
-                    match (planes.val[0], planes.xz[0]) {
+                    match (val[0], xz[0]) {
                         (0, 0) => (LogicBit::Zero, 0, 0),
                         (v, 0) if v == top_mask => (LogicBit::One, u64::MAX, 0),
                         (0, x) if x == top_mask => (LogicBit::X, 0, u64::MAX),
@@ -6881,7 +8374,7 @@ impl Value {
                         _ => return None,
                     }
                 } else {
-                    match (planes.val[0], planes.xz[0]) {
+                    match (val[0], xz[0]) {
                         (0, 0) => (LogicBit::Zero, 0, 0),
                         (u64::MAX, 0) => (LogicBit::One, u64::MAX, 0),
                         (0, u64::MAX) => (LogicBit::X, 0, u64::MAX),
@@ -6890,16 +8383,26 @@ impl Value {
                     }
                 };
                 for i in 1..last {
-                    if planes.val[i] != v_word || planes.xz[i] != x_word {
+                    if val[i] != v_word || xz[i] != x_word {
                         return None;
                     }
                 }
-                if planes.val[last] != (v_word & top_mask)
-                    || planes.xz[last] != (x_word & top_mask)
-                {
+                if val[last] != (v_word & top_mask) || xz[last] != (x_word & top_mask) {
                     return None;
                 }
                 Some(bit)
+            }
+            ValueStorage::Bytes(bytes) => {
+                if bytes.is_empty() || self.width as usize != bytes.len() * 8 {
+                    return None;
+                }
+                let b0 = bytes[0];
+                let bit = match b0 {
+                    0x00 => LogicBit::Zero,
+                    0xFF => LogicBit::One,
+                    _ => return None,
+                };
+                bytes.iter().all(|&b| b == b0).then_some(bit)
             }
         }
     }
@@ -6922,7 +8425,7 @@ impl Value {
             }
         } else {
             Self {
-                storage: ValueStorage::Wide(Box::new(WidePlanes::filled(width, LogicBit::Z))),
+                storage: ValueStorage::wide_filled(width, LogicBit::Z),
                 width,
                 is_signed: false,
                 is_real: false,
@@ -6938,17 +8441,18 @@ mod wide_probe_tests {
 
     #[test]
     fn from_bits_roundtrip() {
-        let mut bits = vec![LogicBit::Zero; 96];
-        bits[0] = LogicBit::One;
-        bits[2] = LogicBit::One;
-        bits[95] = LogicBit::One;
-        let p = WidePlanes::from_bits(&bits);
-        assert_eq!(p.get(0), LogicBit::One);
-        assert_eq!(p.get(1), LogicBit::Zero);
-        assert_eq!(p.get(2), LogicBit::One);
-        assert_eq!(p.get(95), LogicBit::One);
-        assert_eq!(p.val[0], 0b101);
-        assert_eq!(p.val[1], 1u64 << 31);
+        let mut s = ValueStorage::wide_zeroed(96);
+        s.wide_set(0, LogicBit::One);
+        s.wide_set(2, LogicBit::One);
+        s.wide_set(95, LogicBit::One);
+        let (val, xz) = s.wide_planes().unwrap();
+        assert_eq!(ValueStorage::wide_get(val, xz, 0), LogicBit::One);
+        assert_eq!(ValueStorage::wide_get(val, xz, 1), LogicBit::Zero);
+        assert_eq!(ValueStorage::wide_get(val, xz, 2), LogicBit::One);
+        assert_eq!(ValueStorage::wide_get(val, xz, 95), LogicBit::One);
+        assert_eq!(val[0], 0b101);
+        assert_eq!(val[1], 1u64 << 31);
+        assert!(xz.is_empty());
     }
 
     #[test]
@@ -7016,6 +8520,58 @@ mod packed_string_tests {
         let value = Value::from_string(text);
         assert_eq!(value.width, text.chars().count() as u32 * 8);
         assert_eq!(value.to_sv_string(), text.trim_start_matches('\0'));
+    }
+
+    #[test]
+    fn zero_alloc_string_helpers_and_nul_strip() {
+        // Inline and wide values, leading/embedded/trailing NULs, >=0x80 bytes, all-X
+        let empty = Value::zero(0);
+        assert_eq!(empty.sv_string_len(), 0);
+        assert_eq!(empty.sv_string_getc(0), 0);
+        assert_eq!(empty.sv_string_slice(0, 0), Value::zero(0));
+        assert_eq!(empty.sv_string_strip_nul(), Value::zero(0));
+
+        let placeholder_x = Value::new(1024);
+        assert_eq!(placeholder_x.sv_string_len(), 0);
+        assert_eq!(placeholder_x.sv_string_getc(0), 0);
+        assert_eq!(placeholder_x.sv_string_slice(0, 0), Value::zero(0));
+        assert_eq!(placeholder_x.sv_string_strip_nul(), Value::zero(0));
+
+        let short_trailing = Value::from_bytes(&[0x02, 0x42, 0x41, 0x00]);
+        assert_eq!(short_trailing.sv_string_len(), 4);
+        assert_eq!(short_trailing.sv_string_getc(0), 0x02);
+        assert_eq!(short_trailing.sv_string_getc(3), 0x00);
+        assert_eq!(short_trailing.sv_string_getc(4), 0);
+        assert_eq!(
+            short_trailing.sv_string_strip_nul(),
+            Value::from_bytes(&[0x02, 0x42, 0x41])
+        );
+
+        let wide = Value::from_bytes(b"\0\0hello\0\xffworld\0");
+        assert_eq!(wide.sv_string_len(), 13);
+        assert_eq!(wide.sv_string_getc(0), b'h');
+        assert_eq!(wide.sv_string_getc(5), 0);
+        assert_eq!(wide.sv_string_getc(6), 0xff);
+        assert_eq!(wide.sv_string_getc(12), 0);
+        assert_eq!(wide.sv_string_slice(0, 4), Value::from_bytes(b"hello"));
+        assert_eq!(
+            wide.sv_string_slice(6, 11),
+            Value::from_bytes(b"\xffworld")
+        );
+        assert_eq!(wide.sv_string_slice(5, 3), Value::zero(0));
+        assert_eq!(wide.sv_string_slice(0, 13), Value::zero(0));
+        assert_eq!(
+            wide.sv_string_strip_nul(),
+            Value::from_bytes(b"hello\xffworld")
+        );
+
+        let a = Value::from_bytes(b"Abc");
+        let b = Value::from_bytes(b"abc");
+        let c = Value::from_bytes(b"abcd");
+        assert!(a.sv_string_cmp(&b, false) < 0);
+        assert_eq!(a.sv_string_cmp(&b, true), 0);
+        assert_eq!(b.sv_string_cmp(&c, false), -1);
+        assert_eq!(c.sv_string_cmp(&b, false), 1);
     }
 }
 
@@ -7104,6 +8660,351 @@ mod wide_arith_tests {
                 assert!(x.negate().has_xz());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ch6_wide_storage_tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn hash_of(v: &Value) -> u64 {
+        let mut h = DefaultHasher::new();
+        v.hash(&mut h);
+        h.finish()
+    }
+
+    fn reference_reverse_slices(v: &Value, slice: usize) -> Value {
+        let total_w = v.width as usize;
+        if total_w == 0 || slice == 0 || slice >= total_w {
+            return Value {
+                storage: v.storage.clone(),
+                width: v.width,
+                is_signed: false,
+                is_real: false,
+                is_fill: false,
+            };
+        }
+        let mut out = Value::zero(v.width);
+        let full = total_w / slice;
+        let rem = total_w % slice;
+        for k in 0..full {
+            for b in 0..slice {
+                out.set_bit((full - 1 - k) * slice + rem + b, v.get_bit(k * slice + b));
+            }
+        }
+        for b in 0..rem {
+            out.set_bit(b, v.get_bit(full * slice + b));
+        }
+        out
+    }
+
+    #[test]
+    fn wide_storage_eq_hash_and_inline_layout() {
+        assert!(Value::inline_layout_ok());
+        assert!(matches!(Value::zero(100).storage, ValueStorage::Wide2State(_)));
+        assert!(matches!(Value::ones(100).storage, ValueStorage::Wide2State(_)));
+        assert!(matches!(Value::from_u64(42, 100).storage, ValueStorage::Wide2State(_)));
+        assert!(matches!(Value::from_u128(u128::MAX, 200).storage, ValueStorage::Wide2State(_)));
+        assert!(matches!(Value::from_words128([1, 2], 128).storage, ValueStorage::Wide2State(_)));
+        assert!(matches!(Value::new(100).storage, ValueStorage::Wide4State(_)));
+
+        let mut cleared = Value::new(128);
+        cleared.set_bit(5, LogicBit::One);
+        cleared.drop_xz_in_place();
+        assert!(matches!(cleared.storage, ValueStorage::Wide4State(_)));
+        let two_state = Value::from_u64(1 << 5, 128);
+        assert!(matches!(two_state.storage, ValueStorage::Wide2State(_)));
+        assert_eq!(cleared, two_state);
+        assert_eq!(hash_of(&cleared), hash_of(&two_state));
+
+        let mut zeroed_via_set = Value::all_z(200);
+        assert!(zeroed_via_set.set_words(&[0, 0, 0, 0]));
+        assert_eq!(zeroed_via_set, Value::zero(200));
+        assert_eq!(hash_of(&zeroed_via_set), hash_of(&Value::zero(200)));
+    }
+
+    #[test]
+    fn bincode_roundtrip_preserves_wire_schema() {
+        let cfg = crate::xez_bincode_config();
+        let inline = Value::from_inline(0xdead_beef, 0x00ff_00ff, 64);
+        let w2 = Value::from_words(&[0x1122_3344_5566_7788, 0x99aa_bbcc_ddee_ff00, 0x5a], 199);
+        let mut w4 = w2.clone();
+        w4.set_bit(130, LogicBit::X);
+        w4.set_bit(198, LogicBit::Z);
+        let mut w4_clean = Value::new(128);
+        w4_clean.set_words128([123, 456]);
+
+        for orig in [&inline, &w2, &w4, &w4_clean] {
+            let bytes = bincode::serde::encode_to_vec(orig, cfg).unwrap();
+            let (dec, used): (Value, usize) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(dec, *orig);
+            assert_eq!(hash_of(&dec), hash_of(orig));
+        }
+        let bytes_clean = bincode::serde::encode_to_vec(&w4_clean, cfg).unwrap();
+        let (dec_clean, _): (Value, usize) =
+            bincode::serde::decode_from_slice(&bytes_clean, cfg).unwrap();
+        assert!(matches!(dec_clean.storage, ValueStorage::Wide2State(_)));
+    }
+
+    #[test]
+    fn reverse_slices_matches_spec_across_widths_and_xz() {
+        for &w in &[0usize, 1, 7, 12, 16, 64, 65, 100, 200] {
+            let mut known = Value::zero(w as u32);
+            let mut with_xz = Value::zero(w as u32);
+            for i in 0..w {
+                if (i * 7 + 3) % 3 == 0 {
+                    known.set_bit(i, LogicBit::One);
+                }
+                let bit = match (i * 5 + 1) % 4 {
+                    0 => LogicBit::Zero,
+                    1 => LogicBit::One,
+                    2 => LogicBit::X,
+                    _ => LogicBit::Z,
+                };
+                with_xz.set_bit(i, bit);
+            }
+            for &slice in &[1usize, 3, 4, 8, 17, 64, 100] {
+                assert_eq!(
+                    known.reverse_slices(slice),
+                    reference_reverse_slices(&known, slice),
+                    "known mismatch w={w} slice={slice}"
+                );
+                assert!(matches!(
+                    known.reverse_slices(slice).storage,
+                    ValueStorage::Inline { .. } | ValueStorage::Wide2State(_)
+                ));
+                assert_eq!(
+                    with_xz.reverse_slices(slice),
+                    reference_reverse_slices(&with_xz, slice),
+                    "xz mismatch w={w} slice={slice}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_ops_to_f64_cmp_not_ashr_and_case_eq() {
+        // wide_to_f64 exact tie-to-even + sticky + signed negative + X/Z masking
+        let p100 = Value::from_u64(1, 128).shift_left(&Value::from_u64(100, 32));
+        // 2^100 + 2^(100-53) -> exact midpoint above even mantissa -> wait: LSB of 53-bit mantissa is 0, + half = ties to even (2^100)
+        let half = Value::from_u64(1, 128).shift_left(&Value::from_u64(100 - 53, 32));
+        let sticky = Value::from_u64(1, 128);
+        assert_eq!(p100.add(&half).to_f64(), (2f64).powi(100));
+        assert!(p100.add(&half).add(&sticky).to_f64() > (2f64).powi(100));
+        let mut neg = p100.negate();
+        neg.is_signed = true;
+        assert_eq!(neg.to_f64(), -(2f64).powi(100));
+        let mut xz_val = p100.clone();
+        xz_val.set_bit(100, LogicBit::X);
+        assert_eq!(xz_val.to_f64(), 0.0);
+
+        // bitwise_not: ~Z becomes X, clean becomes Wide2State
+        let mut mixed = Value::from_words(&[0xAAAA_5555, 0x0F0F_F0F0, 1], 130);
+        assert!(matches!(mixed.bitwise_not().storage, ValueStorage::Wide2State(_)));
+        mixed.set_bit(10, LogicBit::Z);
+        let not_m = mixed.bitwise_not();
+        assert_eq!(not_m.get_bit(10), LogicBit::X);
+        assert_eq!(not_m.get_bit(0), LogicBit::Zero);
+        assert_eq!(not_m.get_bit(1), LogicBit::One);
+
+        // arith_shift_right with 0, 1, X, Z MSBs + overshift
+        for msb in [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z] {
+            let mut v = Value::from_words(&[0b1010, 0], 100);
+            v.is_signed = true;
+            v.set_bit(99, msb);
+            let shifted = v.arith_shift_right(&Value::from_u64(4, 32));
+            for bit in 96..100 {
+                assert_eq!(shifted.get_bit(bit), msb);
+            }
+            assert_eq!(shifted.get_bit(0), LogicBit::Zero);
+            let overshift = v.arith_shift_right(&Value::from_u64(120, 32));
+            for bit in 0..100 {
+                assert_eq!(overshift.get_bit(bit), msb);
+            }
+        }
+
+        // Signed unequal-width case_eq / casez / casex with X/Z MSB
+        let mut small_x = Value::new(8);
+        small_x.is_signed = true;
+        small_x.set_bit(0, LogicBit::One);
+        let mut big_x = Value::new(100);
+        big_x.is_signed = true;
+        big_x.set_bit(0, LogicBit::One);
+        assert_eq!(small_x.case_eq(&big_x), Value::from_u64(1, 1));
+        assert_eq!(small_x.casez_eq(&big_x), Value::from_u64(1, 1));
+        let mut big_z = Value::all_z(100);
+        big_z.is_signed = true;
+        big_z.set_bit(0, LogicBit::One);
+        assert_eq!(small_x.case_eq(&big_z), Value::from_u64(0, 1));
+        assert_eq!(small_x.casez_eq(&big_z), Value::from_u64(1, 1));
+        assert_eq!(small_x.casex_eq(&big_z), Value::from_u64(1, 1));
+
+        // clog2_unsigned across Wide2State and Wide4State (including 2^117 +/- 1)
+        let p117 = Value::from_u64(1, 128).shift_left(&Value::from_u64(117, 32));
+        let p117_plus_1 = p117.add(&Value::from_u64(1, 128));
+        let p117_minus_1 = p117.sub(&Value::from_u64(1, 128));
+        assert_eq!(p117.clog2_unsigned(), 117);
+        assert_eq!(p117_plus_1.clog2_unsigned(), 118);
+        assert_eq!(p117_minus_1.clog2_unsigned(), 117);
+        let mut p117_4s = p117_plus_1.clone();
+        p117_4s.set_bit(127, LogicBit::Zero); // unchanged value bits
+        p117_4s.set_bit(126, LogicBit::X);
+        assert_eq!(p117_4s.clog2_unsigned(), 118);
+    }
+
+    #[test]
+    fn wire_resolve_ops_match_all_16_bit_pairs_inline_and_wide() {
+        fn ref_wire_resolve(a: LogicBit, b: LogicBit) -> LogicBit {
+            match (a, b) {
+                (LogicBit::Z, x) | (x, LogicBit::Z) => x,
+                (LogicBit::X, _) | (_, LogicBit::X) => LogicBit::X,
+                (x, y) if x == y => x,
+                _ => LogicBit::X,
+            }
+        }
+        fn ref_wired_logic(a: LogicBit, b: LogicBit, is_and: bool) -> LogicBit {
+            let ctrl = if is_and { LogicBit::Zero } else { LogicBit::One };
+            if a == ctrl || b == ctrl {
+                ctrl
+            } else {
+                ref_wire_resolve(a, b)
+            }
+        }
+        fn ref_pull(s: LogicBit, w: LogicBit) -> LogicBit {
+            if s == LogicBit::Z { w } else { s }
+        }
+        fn ref_tranif_unc(m: LogicBit, o: LogicBit) -> LogicBit {
+            if m == o { m } else { LogicBit::X }
+        }
+
+        let bits = [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z];
+        for (idx, &(a_w, b_w)) in [(16u32, 16u32), (4, 8), (16, 130), (160, 160), (160, 97)]
+            .iter()
+            .enumerate()
+        {
+            let mut a = Value::zero(a_w);
+            let mut b = Value::zero(b_w);
+            let w = a_w.max(b_w);
+            for i in 0..a_w as usize {
+                a.set_bit(i, bits[(i + idx) % 4]);
+            }
+            for i in 0..b_w as usize {
+                b.set_bit(i, bits[((i / 4) + i + idx * 3) % 4]);
+            }
+            // Inject an explicit all-16 pair slice starting at bit 0 where both exist
+            if a_w >= 16 && b_w >= 16 {
+                for p in 0..16 {
+                    a.set_bit(p, bits[p / 4]);
+                    b.set_bit(p, bits[p % 4]);
+                }
+            }
+            let r_wres = a.wire_resolve(&b);
+            let r_wand = a.wired_logic(&b, true);
+            let r_wor = a.wired_logic(&b, false);
+            let r_pull = a.wire_resolve_pull(&b);
+            let r_tran = a.tranif_uncertain(&b);
+            assert_eq!(r_wres.width, w);
+            for i in 0..w as usize {
+                let ab = a.get_bit(i);
+                let bb = b.get_bit(i);
+                assert_eq!(r_wres.get_bit(i), ref_wire_resolve(ab, bb));
+                assert_eq!(r_wand.get_bit(i), ref_wired_logic(ab, bb, true));
+                assert_eq!(r_wor.get_bit(i), ref_wired_logic(ab, bb, false));
+                assert_eq!(r_pull.get_bit(i), ref_pull(ab, bb));
+                assert_eq!(r_tran.get_bit(i), ref_tranif_unc(ab, bb));
+            }
+        }
+        // Wide 2-state wire resolution produces Wide2State without XZ plane
+        let w2_a = Value::from_words(&[0xdead_beef, 0xcafe_babe, 0x1234], 150);
+        let w2_b = w2_a.clone();
+        let resolved_same = w2_a.wire_resolve(&w2_b);
+        assert!(matches!(resolved_same.storage, ValueStorage::Wide2State(_)));
+        assert_eq!(resolved_same, w2_a);
+
+        // Fill 'z yields to driven wide value
+        let z_fill = Value::fill_of('z');
+        assert_eq!(w2_a.wire_resolve(&z_fill), w2_a);
+        assert_eq!(z_fill.wire_resolve(&w2_a), w2_a);
+        assert_eq!(z_fill.wire_resolve_pull(&w2_a), w2_a);
+    }
+
+    #[test]
+    fn bytes_storage_arc_string_ops_match_words_and_preserve_serde_hash_eq() {
+        let s = "Hello_World_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let v = Value::from_string(s);
+        assert!(matches!(v.storage, ValueStorage::Bytes(_)));
+        assert_eq!(v.width as usize, s.len() * 8);
+        assert_eq!(v.sv_string_len(), s.len());
+        assert_eq!(v.to_sv_string(), s);
+        assert_eq!(v.sv_string_bytes(), s.as_bytes());
+        assert!(matches!(v.sv_string_bytes_cow(), std::borrow::Cow::Borrowed(_)));
+        assert_eq!(v.sv_string_getc(0), b'H');
+        assert_eq!(v.sv_string_getc(s.len() - 1), b'Z');
+        assert_eq!(v.sv_string_getc(s.len()), 0);
+
+        // Construct an explicit Wide2State equivalent and check Eq + Hash parity.
+        let n = ValueStorage::wide_nwords(v.width);
+        let mut words = vec![0u64; n];
+        assert!(v.words_if_clean(&mut words));
+        let w2 = Value::from_words(&words, v.width);
+        assert!(matches!(w2.storage, ValueStorage::Wide2State(_)));
+        assert_eq!(v, w2);
+        let hash_of = |x: &Value| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            x.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(&v), hash_of(&w2));
+
+        // Bincode round-trip parity (.xez wire format unchanged).
+        let cfg = crate::xez_bincode_config();
+        let b_bytes = bincode::serde::encode_to_vec(&v, cfg).unwrap();
+        let w_bytes = bincode::serde::encode_to_vec(&w2, cfg).unwrap();
+        assert_eq!(b_bytes, w_bytes);
+        let (back, _): (Value, usize) = bincode::serde::decode_from_slice(&b_bytes, cfg).unwrap();
+        assert_eq!(back, v);
+
+        // Zero-alloc ASCII case, concat, putc, slice, strip_nul.
+        let lower = v.sv_string_ascii_case(false);
+        assert_eq!(lower.to_sv_string(), s.to_ascii_lowercase());
+        assert_eq!(v.sv_string_ascii_case(false).sv_string_cmp(&lower, false), 0);
+        assert_eq!(v.sv_string_cmp(&lower, true), 0);
+        assert_eq!(v.sv_string_slice(6, 10).to_sv_string(), "World");
+        assert_eq!(v.sv_string_slice(0, 15).to_sv_string(), &s[..16]);
+
+        let cat = Value::sv_string_concat_refs([&v, &lower]);
+        assert!(matches!(cat.storage, ValueStorage::Bytes(_)));
+        assert_eq!(cat.to_sv_string(), format!("{s}{}", s.to_ascii_lowercase()));
+
+        let mut owned = Value::from_string(s);
+        assert!(owned.sv_string_putc_in_place(0, b'h'));
+        assert_eq!(owned.sv_string_getc(0), b'h');
+        assert_eq!(v.sv_string_getc(0), b'H');
+
+        // Mutations materialize cleanly without breaking Bytes invariants.
+        let mut x_mut = v.clone();
+        x_mut.set_bit(0, LogicBit::X);
+        assert!(x_mut.has_xz());
+        assert!(!v.has_xz());
+        assert_eq!(x_mut.get_bit(0), LogicBit::X);
+        assert_eq!(x_mut.to_two_state().has_xz(), false);
+
+        // Bitwise / reduction / range_select parity against Wide2State.
+        assert_eq!(v.bitwise_not(), w2.bitwise_not());
+        assert_eq!(v.reduce_and(), w2.reduce_and());
+        assert_eq!(v.reduce_or(), w2.reduce_or());
+        assert_eq!(v.reduce_xor(), w2.reduce_xor());
+        assert_eq!(v.range_select(79, 8), w2.range_select(79, 8));
+        assert_eq!(v.range_select(83, 5), w2.range_select(83, 5));
+        assert_eq!(v.bit_select(37), w2.bit_select(37));
+
+        // 8 bytes stay Inline.
+        let short = Value::from_string("12345678");
+        assert!(matches!(short.storage, ValueStorage::Inline { .. }));
     }
 }
 

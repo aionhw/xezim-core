@@ -251,15 +251,537 @@ impl<'a> Iterator for ParamIter<'a> {
 /// source text.
 #[derive(Default)]
 pub(crate) struct DeclTypeInterner {
+    fast_types: HashMap<u64, Vec<(Box<str>, FastTyOwned, Rc<DataType>)>>,
     types: HashMap<(u64, usize), Vec<(Box<str>, Box<[u8]>, Rc<DataType>)>>,
     encoded: Vec<u8>,
     #[cfg(test)]
     pub(crate) copies: usize,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+enum FastRange<'a> {
+    None,
+    Unsized(crate::ast::Span),
+    ConstInt {
+        dim_span: crate::ast::Span,
+        l_span: crate::ast::Span,
+        l_size: Option<u32>,
+        l_signed: bool,
+        l_base: u8,
+        l_val: &'a str,
+        r_span: crate::ast::Span,
+        r_size: Option<u32>,
+        r_signed: bool,
+        r_base: u8,
+        r_val: &'a str,
+    },
+}
+
+enum FastRangeOwned {
+    None,
+    Unsized(crate::ast::Span),
+    ConstInt {
+        dim_span: crate::ast::Span,
+        l_span: crate::ast::Span,
+        l_size: Option<u32>,
+        l_signed: bool,
+        l_base: u8,
+        l_val: Box<str>,
+        r_span: crate::ast::Span,
+        r_size: Option<u32>,
+        r_signed: bool,
+        r_base: u8,
+        r_val: Box<str>,
+    },
+}
+
+impl FastRange<'_> {
+    fn hash_into<H: std::hash::Hasher>(&self, h: &mut H) {
+        use std::hash::Hash;
+        match *self {
+            Self::None => 0u8.hash(h),
+            Self::Unsized(s) => {
+                1u8.hash(h);
+                s.start.hash(h);
+                s.end.hash(h);
+            }
+            Self::ConstInt {
+                dim_span,
+                l_span,
+                l_size,
+                l_signed,
+                l_base,
+                l_val,
+                r_span,
+                r_size,
+                r_signed,
+                r_base,
+                r_val,
+            } => {
+                2u8.hash(h);
+                (dim_span.start, dim_span.end).hash(h);
+                (l_span.start, l_span.end, l_size, l_signed, l_base, l_val).hash(h);
+                (r_span.start, r_span.end, r_size, r_signed, r_base, r_val).hash(h);
+            }
+        }
+    }
+
+    fn to_owned(&self) -> FastRangeOwned {
+        match *self {
+            Self::None => FastRangeOwned::None,
+            Self::Unsized(s) => FastRangeOwned::Unsized(s),
+            Self::ConstInt {
+                dim_span,
+                l_span,
+                l_size,
+                l_signed,
+                l_base,
+                l_val,
+                r_span,
+                r_size,
+                r_signed,
+                r_base,
+                r_val,
+            } => FastRangeOwned::ConstInt {
+                dim_span,
+                l_span,
+                l_size,
+                l_signed,
+                l_base,
+                l_val: l_val.into(),
+                r_span,
+                r_size,
+                r_signed,
+                r_base,
+                r_val: r_val.into(),
+            },
+        }
+    }
+}
+
+impl FastRangeOwned {
+    fn as_ref(&self) -> FastRange<'_> {
+        match self {
+            Self::None => FastRange::None,
+            Self::Unsized(s) => FastRange::Unsized(*s),
+            Self::ConstInt {
+                dim_span,
+                l_span,
+                l_size,
+                l_signed,
+                l_base,
+                l_val,
+                r_span,
+                r_size,
+                r_signed,
+                r_base,
+                r_val,
+            } => FastRange::ConstInt {
+                dim_span: *dim_span,
+                l_span: *l_span,
+                l_size: *l_size,
+                l_signed: *l_signed,
+                l_base: *l_base,
+                l_val,
+                r_span: *r_span,
+                r_size: *r_size,
+                r_signed: *r_signed,
+                r_base: *r_base,
+                r_val,
+            },
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum FastTy<'a> {
+    IntVec {
+        kind: u8,
+        signing: Option<u8>,
+        range: FastRange<'a>,
+        span: crate::ast::Span,
+    },
+    IntAtom {
+        kind: u8,
+        signing: Option<u8>,
+        span: crate::ast::Span,
+    },
+    Real {
+        kind: u8,
+        span: crate::ast::Span,
+    },
+    Simple {
+        kind: u8,
+        span: crate::ast::Span,
+    },
+    Void(crate::ast::Span),
+    Implicit {
+        signing: Option<u8>,
+        range: FastRange<'a>,
+        span: crate::ast::Span,
+    },
+    TypeRef {
+        scope: Option<(&'a str, crate::ast::Span)>,
+        ident: (&'a str, crate::ast::Span),
+        tn_span: crate::ast::Span,
+        span: crate::ast::Span,
+    },
+}
+
+enum FastTyOwned {
+    IntVec {
+        kind: u8,
+        signing: Option<u8>,
+        range: FastRangeOwned,
+        span: crate::ast::Span,
+    },
+    IntAtom {
+        kind: u8,
+        signing: Option<u8>,
+        span: crate::ast::Span,
+    },
+    Real {
+        kind: u8,
+        span: crate::ast::Span,
+    },
+    Simple {
+        kind: u8,
+        span: crate::ast::Span,
+    },
+    Void(crate::ast::Span),
+    Implicit {
+        signing: Option<u8>,
+        range: FastRangeOwned,
+        span: crate::ast::Span,
+    },
+    TypeRef {
+        scope: Option<(Box<str>, crate::ast::Span)>,
+        ident: (Box<str>, crate::ast::Span),
+        tn_span: crate::ast::Span,
+        span: crate::ast::Span,
+    },
+}
+
+impl<'a> FastTy<'a> {
+    fn from_data_type(ty: &'a DataType) -> Option<Self> {
+        use crate::ast::expr::{ExprKind, NumberBase, NumberLiteral};
+        use crate::ast::types::{
+            IntegerAtomType, IntegerVectorType, PackedDimension, RealType, SimpleType, Signing,
+        };
+        let enc_signing = |s: Option<Signing>| {
+            s.map(|x| match x {
+                Signing::Signed => 0,
+                Signing::Unsigned => 1,
+            })
+        };
+        let enc_base = |b: NumberBase| match b {
+            NumberBase::Decimal => 0,
+            NumberBase::Binary => 1,
+            NumberBase::Octal => 2,
+            NumberBase::Hex => 3,
+        };
+        let enc_dims = |dims: &'a [PackedDimension]| -> Option<FastRange<'a>> {
+            match dims {
+                [] => Some(FastRange::None),
+                [PackedDimension::Unsized(s)] => Some(FastRange::Unsized(*s)),
+                [PackedDimension::Range { left, right, span }] => match (&left.kind, &right.kind) {
+                    (
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: l_size,
+                            signed: l_signed,
+                            base: l_base,
+                            value: l_val,
+                            ..
+                        }),
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: r_size,
+                            signed: r_signed,
+                            base: r_base,
+                            value: r_val,
+                            ..
+                        }),
+                    ) => Some(FastRange::ConstInt {
+                        dim_span: *span,
+                        l_span: left.span,
+                        l_size: *l_size,
+                        l_signed: *l_signed,
+                        l_base: enc_base(*l_base),
+                        l_val: l_val.as_str(),
+                        r_span: right.span,
+                        r_size: *r_size,
+                        r_signed: *r_signed,
+                        r_base: enc_base(*r_base),
+                        r_val: r_val.as_str(),
+                    }),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        Some(match ty {
+            DataType::IntegerVector {
+                kind,
+                signing,
+                dimensions,
+                span,
+            } => Self::IntVec {
+                kind: match kind {
+                    IntegerVectorType::Bit => 0,
+                    IntegerVectorType::Logic => 1,
+                    IntegerVectorType::Reg => 2,
+                },
+                signing: enc_signing(*signing),
+                range: enc_dims(dimensions)?,
+                span: *span,
+            },
+            DataType::IntegerAtom {
+                kind,
+                signing,
+                span,
+            } => Self::IntAtom {
+                kind: match kind {
+                    IntegerAtomType::Byte => 0,
+                    IntegerAtomType::ShortInt => 1,
+                    IntegerAtomType::Int => 2,
+                    IntegerAtomType::LongInt => 3,
+                    IntegerAtomType::Integer => 4,
+                    IntegerAtomType::Time => 5,
+                },
+                signing: enc_signing(*signing),
+                span: *span,
+            },
+            DataType::Real { kind, span } => Self::Real {
+                kind: match kind {
+                    RealType::Real => 0,
+                    RealType::ShortReal => 1,
+                    RealType::RealTime => 2,
+                },
+                span: *span,
+            },
+            DataType::Simple { kind, span } => Self::Simple {
+                kind: match kind {
+                    SimpleType::String => 0,
+                    SimpleType::Chandle => 1,
+                    SimpleType::Event => 2,
+                },
+                span: *span,
+            },
+            DataType::Void(span) => Self::Void(*span),
+            DataType::Implicit {
+                signing,
+                dimensions,
+                span,
+            } => Self::Implicit {
+                signing: enc_signing(*signing),
+                range: enc_dims(dimensions)?,
+                span: *span,
+            },
+            DataType::TypeReference {
+                name,
+                dimensions,
+                type_args,
+                span,
+            } if dimensions.is_empty()
+                && type_args.is_empty()
+                && name.scopes.len() <= 1
+                && name.scopes.iter().all(|s| s.type_args.is_empty()) =>
+            {
+                Self::TypeRef {
+                    scope: name
+                        .scopes
+                        .first()
+                        .map(|s| (s.name.name.as_str(), s.name.span)),
+                    ident: (name.name.name.as_str(), name.name.span),
+                    tn_span: name.span,
+                    span: *span,
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    fn hash_with_owner<H: std::hash::Hasher>(&self, owner: &str, h: &mut H) {
+        use std::hash::Hash;
+        owner.hash(h);
+        match self {
+            Self::IntVec {
+                kind,
+                signing,
+                range,
+                span,
+            } => {
+                0u8.hash(h);
+                (*kind, *signing, span.start, span.end).hash(h);
+                range.hash_into(h);
+            }
+            Self::IntAtom {
+                kind,
+                signing,
+                span,
+            } => {
+                1u8.hash(h);
+                (*kind, *signing, span.start, span.end).hash(h);
+            }
+            Self::Real { kind, span } => {
+                2u8.hash(h);
+                (*kind, span.start, span.end).hash(h);
+            }
+            Self::Simple { kind, span } => {
+                3u8.hash(h);
+                (*kind, span.start, span.end).hash(h);
+            }
+            Self::Void(span) => {
+                4u8.hash(h);
+                (span.start, span.end).hash(h);
+            }
+            Self::Implicit {
+                signing,
+                range,
+                span,
+            } => {
+                5u8.hash(h);
+                (*signing, span.start, span.end).hash(h);
+                range.hash_into(h);
+            }
+            Self::TypeRef {
+                scope,
+                ident,
+                tn_span,
+                span,
+            } => {
+                6u8.hash(h);
+                scope.map(|(n, s)| (n, s.start, s.end)).hash(h);
+                (ident.0, ident.1.start, ident.1.end).hash(h);
+                (tn_span.start, tn_span.end, span.start, span.end).hash(h);
+            }
+        }
+    }
+
+    fn to_owned(&self) -> FastTyOwned {
+        match *self {
+            Self::IntVec {
+                kind,
+                signing,
+                ref range,
+                span,
+            } => FastTyOwned::IntVec {
+                kind,
+                signing,
+                range: range.to_owned(),
+                span,
+            },
+            Self::IntAtom {
+                kind,
+                signing,
+                span,
+            } => FastTyOwned::IntAtom {
+                kind,
+                signing,
+                span,
+            },
+            Self::Real { kind, span } => FastTyOwned::Real { kind, span },
+            Self::Simple { kind, span } => FastTyOwned::Simple { kind, span },
+            Self::Void(span) => FastTyOwned::Void(span),
+            Self::Implicit {
+                signing,
+                ref range,
+                span,
+            } => FastTyOwned::Implicit {
+                signing,
+                range: range.to_owned(),
+                span,
+            },
+            Self::TypeRef {
+                scope,
+                ident,
+                tn_span,
+                span,
+            } => FastTyOwned::TypeRef {
+                scope: scope.map(|(n, s)| (n.into(), s)),
+                ident: (ident.0.into(), ident.1),
+                tn_span,
+                span,
+            },
+        }
+    }
+}
+
+impl FastTyOwned {
+    fn as_ref(&self) -> FastTy<'_> {
+        match self {
+            Self::IntVec {
+                kind,
+                signing,
+                range,
+                span,
+            } => FastTy::IntVec {
+                kind: *kind,
+                signing: *signing,
+                range: range.as_ref(),
+                span: *span,
+            },
+            Self::IntAtom {
+                kind,
+                signing,
+                span,
+            } => FastTy::IntAtom {
+                kind: *kind,
+                signing: *signing,
+                span: *span,
+            },
+            Self::Real { kind, span } => FastTy::Real {
+                kind: *kind,
+                span: *span,
+            },
+            Self::Simple { kind, span } => FastTy::Simple {
+                kind: *kind,
+                span: *span,
+            },
+            Self::Void(span) => FastTy::Void(*span),
+            Self::Implicit {
+                signing,
+                range,
+                span,
+            } => FastTy::Implicit {
+                signing: *signing,
+                range: range.as_ref(),
+                span: *span,
+            },
+            Self::TypeRef {
+                scope,
+                ident,
+                tn_span,
+                span,
+            } => FastTy::TypeRef {
+                scope: scope.as_ref().map(|(n, s)| (&**n, *s)),
+                ident: (&*ident.0, ident.1),
+                tn_span: *tn_span,
+                span: *span,
+            },
+        }
+    }
+}
+
 impl DeclTypeInterner {
     /// The shared copy of `ty` as definition `owner` declares it.
     pub(crate) fn intern(&mut self, ty: &DataType, owner: &str) -> Rc<DataType> {
+        if let Some(fast) = FastTy::from_data_type(ty) {
+            let mut hash = DeterministicState::default().build_hasher();
+            fast.hash_with_owner(owner, &mut hash);
+            let bucket = self.fast_types.entry(hash.finish()).or_default();
+            for (candidate_owner, candidate_ty, candidate) in bucket.iter() {
+                if &**candidate_owner == owner && candidate_ty.as_ref() == fast {
+                    return Rc::clone(candidate);
+                }
+            }
+            let shared = Self::shared_copy(ty);
+            #[cfg(test)]
+            {
+                self.copies += 1;
+            }
+            bucket.push((owner.into(), fast.to_owned(), Rc::clone(&shared)));
+            return shared;
+        }
         self.encoded.clear();
         if bincode::serde::encode_into_std_write(ty, &mut self.encoded, crate::xez_bincode_config())
             .is_err()
@@ -614,5 +1136,123 @@ mod tests {
             bincode::serde::encode_to_vec(&types, cfg).unwrap(),
             bincode::serde::encode_to_vec(types.as_map(), cfg).unwrap()
         );
+    }
+
+    #[test]
+    fn fast_intern_covers_common_shapes_and_preserves_spans_and_owner() {
+        use crate::ast::Identifier;
+        use crate::ast::types::{
+            IntegerAtomType, RealType, SimpleType, Signing, TypeName, TypeScope,
+        };
+
+        let sp = |a: u32, b: u32| Span::new(a, b);
+        let mut pool = DeclTypeInterner::default();
+
+        let int_ty = DataType::IntegerAtom {
+            kind: IntegerAtomType::Int,
+            signing: Some(Signing::Signed),
+            span: sp(10, 13),
+        };
+        let r1 = pool.intern(&int_ty, "m1");
+        let r2 = pool.intern(&int_ty, "m1");
+        assert!(Rc::ptr_eq(&r1, &r2));
+        let r3 = pool.intern(&int_ty, "m2");
+        assert!(!Rc::ptr_eq(&r1, &r3));
+        assert_eq!(pool.copies, 2);
+
+        let samples = vec![
+            DataType::Real {
+                kind: RealType::Real,
+                span: sp(20, 24),
+            },
+            DataType::Simple {
+                kind: SimpleType::String,
+                span: sp(30, 36),
+            },
+            DataType::Void(sp(40, 44)),
+            DataType::IntegerVector {
+                kind: IntegerVectorType::Bit,
+                signing: None,
+                dimensions: vec![],
+                span: sp(50, 53),
+            },
+            DataType::IntegerVector {
+                kind: IntegerVectorType::Reg,
+                signing: Some(Signing::Unsigned),
+                dimensions: vec![PackedDimension::Unsized(sp(60, 62))],
+                span: sp(55, 62),
+            },
+            DataType::Implicit {
+                signing: Some(Signing::Signed),
+                dimensions: vec![PackedDimension::Range {
+                    left: Box::new(number("31", 70)),
+                    right: Box::new(number("0", 73)),
+                    span: sp(69, 74),
+                }],
+                span: sp(65, 74),
+            },
+            DataType::TypeReference {
+                name: Box::new(TypeName {
+                    scopes: vec![],
+                    name: Identifier {
+                        name: "word_t".to_string(),
+                        span: sp(80, 86),
+                    },
+                    span: sp(80, 86),
+                    bound: Default::default(),
+                }),
+                dimensions: vec![],
+                type_args: vec![],
+                span: sp(80, 86),
+            },
+            DataType::TypeReference {
+                name: Box::new(TypeName {
+                    scopes: vec![TypeScope {
+                        name: Identifier {
+                            name: "pkg".to_string(),
+                            span: sp(90, 93),
+                        },
+                        type_args: vec![],
+                    }],
+                    name: Identifier {
+                        name: "word_t".to_string(),
+                        span: sp(95, 101),
+                    },
+                    span: sp(90, 101),
+                    bound: Default::default(),
+                }),
+                dimensions: vec![],
+                type_args: vec![],
+                span: sp(90, 101),
+            },
+        ];
+
+        for ty in &samples {
+            let a = pool.intern(ty, "leaf");
+            let b = pool.intern(ty, "leaf");
+            assert!(Rc::ptr_eq(&a, &b));
+        }
+        assert_eq!(pool.copies, 2 + samples.len());
+        // Fast types live in `fast_types`, without populating `bincode` `types`.
+        assert!(pool.types.is_empty());
+
+        // Different span or literal on TypeReference must produce a distinct copy.
+        let shifted_tref = DataType::TypeReference {
+            name: Box::new(TypeName {
+                scopes: vec![],
+                name: Identifier {
+                    name: "word_t".to_string(),
+                    span: sp(200, 206),
+                },
+                span: sp(200, 206),
+                bound: Default::default(),
+            }),
+            dimensions: vec![],
+            type_args: vec![],
+            span: sp(200, 206),
+        };
+        let t_orig = pool.intern(&samples[6], "leaf");
+        let t_shift = pool.intern(&shifted_tref, "leaf");
+        assert!(!Rc::ptr_eq(&t_orig, &t_shift));
     }
 }

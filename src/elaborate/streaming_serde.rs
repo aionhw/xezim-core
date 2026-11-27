@@ -274,6 +274,7 @@ impl Serialize for ElaboratedModule {
             nets,
             implicit_nets,
             interconnect_nets,
+            interconnect_elem_types,
             elab_diagnostics,
             instances,
             upward_scopes: _,
@@ -319,6 +320,7 @@ impl Serialize for ElaboratedModule {
             src_file_of_module,
             source_orig_lines,
             source_line_maps: _,
+            default_automatic: _,
         } = self;
 
         let mut st = serializer.serialize_struct("ElaboratedModule", 120)?;
@@ -455,6 +457,7 @@ impl Serialize for ElaboratedModule {
         st.serialize_field("nets", nets)?;
         st.serialize_field("implicit_nets", implicit_nets)?;
         st.serialize_field("interconnect_nets", interconnect_nets)?;
+        st.serialize_field("interconnect_elem_types", interconnect_elem_types)?;
         st.serialize_field("elab_diagnostics", elab_diagnostics)?;
         st.serialize_field("instances", instances)?;
         st.serialize_field("resolved_binds", resolved_binds)?;

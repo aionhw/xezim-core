@@ -100,12 +100,16 @@ impl<'a> Parser<'a> {
     pub(in crate::parse) fn parse_net_declaration(&mut self) -> NetDeclaration {
         let start = self.current_span().start;
         let net_type = self.parse_optional_net_type().unwrap_or(NetType::Wire);
+        // §6.7.1: a net type keyword shall not be followed directly by `reg`.
+        if self.at(TokenKind::KwReg) {
+            self.error("a net type keyword shall not be followed directly by 'reg' (IEEE 1800-2023 §6.7.1)");
+        }
         // §10.3.1: declaration assignments retain the same strength pair as
         // explicit continuous assignments, for resolution and `%v` reporting.
         let spec = self.parse_strength_group();
         if let Some((strength, span)) = &spec
             && matches!(strength.as_str(), "small" | "medium" | "large")
-            && net_type != NetType::TriReg
+            && !matches!(net_type, NetType::TriReg | NetType::Interconnect)
             && crate::strict_checks()
         {
             self.diagnostics.push(Diagnostic::error(
@@ -115,7 +119,8 @@ impl<'a> Parser<'a> {
         }
         // §6.9.2: optional `vectored` / `scalared` charge/drive qualifier
         // between the net type and the (optional) range — `tri1 vectored [15:0] a;`.
-        if self.at(TokenKind::KwVectored) || self.at(TokenKind::KwScalared) {
+        let has_vec_scal = self.at(TokenKind::KwVectored) || self.at(TokenKind::KwScalared);
+        if has_vec_scal {
             self.bump();
         }
         // §10.3.3: optional net delay `wire #10 w;` / `wire #(d1,d2) w;`.
@@ -190,6 +195,7 @@ impl<'a> Parser<'a> {
         }
         let declarators = self.parse_net_declarator_list();
         if let Some((strength, span)) = &spec
+            && !matches!(net_type, NetType::Interconnect)
             && strength.contains(',')
             && declarators.iter().any(|decl| decl.init.is_none())
             && crate::strict_checks()
@@ -200,6 +206,33 @@ impl<'a> Parser<'a> {
             ));
         }
         self.expect(TokenKind::Semicolon);
+        if matches!(net_type, NetType::Interconnect) {
+            if !matches!(data_type, DataType::Implicit { .. }) {
+                self.error("'interconnect' net shall not specify an explicit data type (IEEE 1800-2023 §6.7.1)");
+            }
+            if spec.is_some() {
+                self.error("'interconnect' net shall not specify drive or charge strength (IEEE 1800-2023 §6.7.1)");
+            }
+            if has_vec_scal {
+                self.error("'interconnect' net shall not specify 'vectored' or 'scalared' (IEEE 1800-2023 §6.7)");
+            }
+            if delay.1.is_some() || delay.2.is_some() {
+                self.error("'interconnect' net shall specify at most one delay value (IEEE 1800-2023 §6.7.1)");
+            }
+            if declarators.iter().any(|d| d.init.is_some()) {
+                self.error("'interconnect' net shall not have a net declaration assignment (IEEE 1800-2023 §6.7.1)");
+            }
+        } else if has_vec_scal {
+            let missing_packed_dim = match &data_type {
+                DataType::Implicit { dimensions, .. }
+                | DataType::IntegerVector { dimensions, .. } => dimensions.is_empty(),
+                DataType::IntegerAtom { .. } => true,
+                _ => false,
+            };
+            if missing_packed_dim {
+                self.error("'vectored'/'scalared' net declaration requires at least one packed dimension (IEEE 1800-2023 §6.7 fn. 16)");
+            }
+        }
         let (delay, delay_fall, delay_off) = delay;
         NetDeclaration {
             net_type,

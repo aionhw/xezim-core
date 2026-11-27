@@ -467,6 +467,9 @@ pub(super) fn check_module_use_before_decl(
         fn typedef(&mut self, td: &TypedefDeclaration, scope: &Scope) {
             self.ty(&td.data_type, scope);
             self.unpacked(&td.dimensions, scope);
+            for e in &td.iface_selects {
+                self.expr(e, scope);
+            }
         }
         fn event_expr(&mut self, ev: &EventExpr, scope: &Scope) {
             self.expr(&ev.expr, scope);
@@ -882,6 +885,7 @@ pub(super) fn check_module_use_before_decl(
                         }
                     }
                     ClassItem::Typedef(td) => self.typedef(td, &inner),
+                    ClassItem::Nettype(nd) => self.ty(&nd.data_type, &inner),
                     ClassItem::Parameter(p) => self.parameter(p, &inner),
                     ClassItem::Class(nested) => {
                         // §8.23: nested classes inherit lexical access to
@@ -1574,6 +1578,10 @@ pub(super) fn check_module_use_before_decl(
                     ClassItem::Typedef(td) => {
                         names.insert(td.name.name.clone());
                         enum_names(&td.data_type, names);
+                    }
+                    ClassItem::Nettype(nd) => {
+                        names.insert(nd.name.name.clone());
+                        enum_names(&nd.data_type, names);
                     }
                     ClassItem::Class(c) => {
                         names.insert(c.name.name.clone());

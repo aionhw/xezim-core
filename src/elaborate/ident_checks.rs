@@ -325,30 +325,199 @@ pub(super) fn validate_stmt_idents(
     Ok(())
 }
 
-/// §6.7.1: a net's data type is 4-state integral or an aggregate of such; a
-/// class handle, `string`, `chandle` or `event` can never be a net.
+fn is_legacy_verilog_file(elab: &ElaboratedModule, span: Span, owner: Option<&str>) -> bool {
+    let loc = match owner {
+        Some(o) => span_location_of(elab, span, o).or_else(|| span_location(elab, span)),
+        None => span_location(elab, span),
+    };
+    let Some(loc) = loc else {
+        return false;
+    };
+    // span_location formats "<file>:<line>" (or "<file>:<line>:<col>")
+    let file_part = loc.split(':').next().unwrap_or("");
+    file_part.ends_with(".v")
+}
+
+fn illegal_builtin_net_type(
+    dt: &DataType,
+    net_type: NetType,
+    allow_v_wire_real: bool,
+    elab: &ElaboratedModule,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Option<String> {
+    if depth >= 64 {
+        return None;
+    }
+    match dt {
+        DataType::Implicit { .. } => None,
+        DataType::IntegerVector { kind, .. } => match kind {
+            IntegerVectorType::Logic | IntegerVectorType::Reg => None,
+            IntegerVectorType::Bit => Some("2-state 'bit'".to_string()),
+        },
+        DataType::IntegerAtom { kind, .. } => match kind {
+            IntegerAtomType::Integer | IntegerAtomType::Time => None,
+            _ => Some(format!("2-state '{}'", format!("{:?}", kind).to_lowercase())),
+        },
+        DataType::Real { kind, .. } => {
+            if allow_v_wire_real
+                && matches!(net_type, NetType::Wire)
+                && matches!(kind, RealType::Real)
+            {
+                None
+            } else {
+                Some(format!(
+                    "real type '{}'",
+                    format!("{:?}", kind).to_lowercase()
+                ))
+            }
+        }
+        DataType::Simple { kind, .. } => Some(format!("{:?}", kind).to_lowercase()),
+        DataType::Void(_) => Some("void".to_string()),
+        DataType::Interface { .. } => Some("interface".to_string()),
+        DataType::Enum(e) => match e.base_type.as_deref() {
+            None => Some("2-state enum (default 'int' base)".to_string()),
+            Some(bt) => illegal_builtin_net_type(bt, net_type, false, elab, visited, depth + 1),
+        },
+        DataType::Struct(su) => {
+            for m in &su.members {
+                for d in &m.declarators {
+                    let eff = struct_member_dims(
+                        &m.data_type,
+                        &d.dimensions,
+                        &elab.typedef_unpacked_dims,
+                    );
+                    if d.dimensions.iter().chain(eff.iter()).any(|dim| {
+                        matches!(
+                            dim,
+                            UnpackedDimension::Unsized(_)
+                                | UnpackedDimension::Queue { .. }
+                                | UnpackedDimension::Associative { .. }
+                        )
+                    }) {
+                        return Some(format!(
+                            "struct member '{}' with dynamic/queue/associative array",
+                            d.name.name
+                        ));
+                    }
+                }
+                if let Some(bad) =
+                    illegal_builtin_net_type(&m.data_type, net_type, false, elab, visited, depth + 1)
+                {
+                    return Some(bad);
+                }
+            }
+            None
+        }
+        DataType::TypeReference { name, .. } => {
+            let key = nettype_decl_key(name);
+            let bad_dims = lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                .or_else(|| elab.typedef_unpacked_dims.get(&key))
+                .or_else(|| elab.typedef_unpacked_dims.get(&name.name.name))
+                .is_some_and(|dims| {
+                    dims.iter().any(|dim| {
+                        matches!(
+                            dim,
+                            UnpackedDimension::Unsized(_)
+                                | UnpackedDimension::Queue { .. }
+                                | UnpackedDimension::Associative { .. }
+                        )
+                    })
+                });
+            if bad_dims {
+                return Some(format!(
+                    "dynamic/queue/associative array typedef '{}'",
+                    key
+                ));
+            }
+            let inner = lookup_scoped_type(name, &elab.typedef_types)
+                .or_else(|| elab.typedef_types.get(&key))
+                .or_else(|| elab.typedef_types.get(&name.name.name));
+            if let Some(next) = inner
+                && !matches!(next, DataType::Void(_))
+            {
+                let self_ref = matches!(
+                    next,
+                    DataType::TypeReference { name: nn, .. }
+                        if nettype_decl_key(nn) == key || nn.name.name == key
+                );
+                if !self_ref && visited.insert(key.clone()) {
+                    let res = illegal_builtin_net_type(
+                        next,
+                        net_type,
+                        false,
+                        elab,
+                        visited,
+                        depth + 1,
+                    );
+                    visited.remove(&key);
+                    return res;
+                }
+                return None;
+            }
+            if elab.classes.contains_key(&key) || elab.classes.contains_key(&name.name.name) {
+                return Some(format!("class type '{}'", name.name.name));
+            }
+            None
+        }
+    }
+}
+
+/// §6.7.1: a built-in net's data type shall be a 4-state integral type (or
+/// packed/unpacked struct/array of 4-state integral types). `bit`, 2-state
+/// integer atoms, real types, class handles, `string`, `chandle`, and `event`
+/// are illegal on built-in nets.
 pub(super) fn check_net_data_type(
     nd: &crate::ast::decl::NetDeclaration,
     elab: &ElaboratedModule,
 ) -> Result<(), String> {
-    let bad = match &nd.data_type {
-        DataType::TypeReference { name, .. }
-            if elab.classes.contains_key(&name.name.name)
-                && elab
-                    .typedef_types
-                    .get(&name.name.name)
-                    .is_none_or(|dt| matches!(dt, DataType::Void(_))) =>
-        {
-            Some(format!("class type '{}'", name.name.name))
-        }
-        DataType::Simple { kind, .. } => Some(format!("{:?}", kind).to_lowercase()),
-        _ => None,
-    };
-    match bad {
+    check_net_data_type_in(nd, elab, None)
+}
+
+pub(super) fn check_net_data_type_in(
+    nd: &crate::ast::decl::NetDeclaration,
+    elab: &ElaboratedModule,
+    owner: Option<&str>,
+) -> Result<(), String> {
+    if matches!(nd.net_type, NetType::Wreal | NetType::Interconnect) {
+        return Ok(());
+    }
+    let allow_v_wire_real = is_legacy_verilog_file(elab, nd.span, owner);
+    let mut visited = HashSet::default();
+    match illegal_builtin_net_type(
+        &nd.data_type,
+        nd.net_type,
+        allow_v_wire_real,
+        elab,
+        &mut visited,
+        0,
+    ) {
         Some(what) => Err(span_error(
             elab,
             nd.span,
-            &format!("illegal net data type: {} (IEEE 1800-2017 §6.7.1)", what),
+            &format!("illegal net data type: {} (IEEE 1800-2023 §6.7.1)", what),
+        )),
+        None => Ok(()),
+    }
+}
+
+pub(super) fn check_net_port_data_type(
+    net_type: NetType,
+    dt: &DataType,
+    span: Span,
+    elab: &ElaboratedModule,
+    owner: Option<&str>,
+) -> Result<(), String> {
+    if matches!(net_type, NetType::Wreal | NetType::Interconnect) {
+        return Ok(());
+    }
+    let allow_v_wire_real = is_legacy_verilog_file(elab, span, owner);
+    let mut visited = HashSet::default();
+    match illegal_builtin_net_type(dt, net_type, allow_v_wire_real, elab, &mut visited, 0) {
+        Some(what) => Err(span_error(
+            elab,
+            span,
+            &format!("illegal net data type: {} (IEEE 1800-2023 §6.7.1)", what),
         )),
         None => Ok(()),
     }

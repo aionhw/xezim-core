@@ -308,6 +308,9 @@ pub(super) fn class(
             ClassItem::Typedef(t) => {
                 hide(&mut body_bindings, &t.name.name);
             }
+            ClassItem::Nettype(t) => {
+                hide(&mut body_bindings, &t.name.name);
+            }
             ClassItem::Class(c) => {
                 hide(&mut body_bindings, &c.name.name);
             }
@@ -340,6 +343,7 @@ pub(super) fn class(
                 }
             }
             ClassItem::Typedef(t) => t.data_type = data_type(&t.data_type, prefix, outer_bindings),
+            ClassItem::Nettype(n) => n.data_type = data_type(&n.data_type, prefix, outer_bindings),
             ClassItem::Method(m) => {
                 let (ports, body) = match &mut m.kind {
                     ClassMethodKind::Function(f)

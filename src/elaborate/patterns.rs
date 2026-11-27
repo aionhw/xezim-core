@@ -238,6 +238,14 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
                 } else if matches!(
                     &resolved,
                     DataType::Simple {
+                        kind: SimpleType::String,
+                        ..
+                    }
+                ) {
+                    Value::zero(0).into()
+                } else if matches!(
+                    &resolved,
+                    DataType::Simple {
                         kind: SimpleType::Chandle,
                         ..
                     }

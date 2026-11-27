@@ -290,11 +290,33 @@ pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, prec_s: 
             ModuleItem::NettypeDeclaration(nd) => {
                 visible.insert(nd.name.name.clone());
             }
-            ModuleItem::TypedefDeclaration(td) if !td.forward => {
-                visible.remove(&td.name.name);
-            }
             ModuleItem::ClassDeclaration(cd) => {
                 visible.remove(&cd.name.name);
+                fn collect_class_nettypes(
+                    c: &crate::ast::decl::ClassDeclaration,
+                    pfx: &str,
+                    visible: &mut HashSet<String>,
+                ) {
+                    for ci in &c.items {
+                        match ci {
+                            crate::ast::decl::ClassItem::Nettype(nd) => {
+                                visible.insert(format!("{pfx}::{}", nd.name.name));
+                            }
+                            crate::ast::decl::ClassItem::Class(sub) => {
+                                collect_class_nettypes(
+                                    sub,
+                                    &format!("{pfx}::{}", sub.name.name),
+                                    visible,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                collect_class_nettypes(cd, &cd.name.name, &mut visible);
+            }
+            ModuleItem::TypedefDeclaration(td) if !td.forward => {
+                visible.remove(&td.name.name);
             }
             _ => {}
         }
@@ -318,10 +340,12 @@ fn nettype_delay_args(dd: &mut crate::ast::decl::DataDeclaration) -> Option<&mut
     if type_args.is_empty() || type_args.len() > 3 {
         return None;
     }
-    let key = match name.scopes.as_slice() {
-        [] => name.name.name.clone(),
-        [pkg] => format!("{}::{}", pkg.name.name, name.name.name),
-        _ => return None,
+    let key = if name.scopes.is_empty() {
+        name.name.name.clone()
+    } else {
+        let mut parts: Vec<&str> = name.scopes.iter().map(|s| s.name.name.as_str()).collect();
+        parts.push(&name.name.name);
+        parts.join("::")
     };
     NETTYPE_NAMES
         .with(|n| n.borrow().contains(&key))

@@ -418,7 +418,13 @@ impl<'a> Parser<'a> {
                                 sp,
                             ));
                         } else {
-                            type_args.push(self.parse_expression());
+                            let expr = self.parse_expression();
+                            let expr = if self.at(TokenKind::Colon) {
+                                self.parse_mintypmax_rest(expr)
+                            } else {
+                                expr
+                            };
+                            type_args.push(expr);
                         }
                         if self.eat(TokenKind::Comma).is_none() {
                             break;
@@ -426,6 +432,16 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(TokenKind::RParen);
+            } else if matches!(
+                self.current_kind(),
+                TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral
+            ) || (self.at(TokenKind::Identifier)
+                && matches!(
+                    self.peek_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ))
+            {
+                type_args.push(self.parse_delay_value());
             }
         }
         type_args
@@ -503,6 +519,7 @@ impl<'a> Parser<'a> {
         let start = self.current_span().start;
         let mut scopes: Vec<crate::ast::types::TypeScope> = Vec::new();
         let mut name = self.parse_identifier();
+        let mut bound = crate::ast::binding::Bound::UNSET;
         loop {
             if self.at(TokenKind::DoubleColon) {
                 self.bump(); // ::
@@ -523,6 +540,9 @@ impl<'a> Parser<'a> {
             {
                 let args = self.parse_type_args_hash(start);
                 self.expect(TokenKind::DoubleColon);
+                if args.is_empty() {
+                    bound = bound.with_explicit_empty_spec(scopes.len());
+                }
                 scopes.push(crate::ast::types::TypeScope {
                     name,
                     type_args: args,
@@ -536,7 +556,7 @@ impl<'a> Parser<'a> {
             scopes,
             name,
             span: self.span_from(start),
-            bound: Default::default(),
+            bound,
         }
     }
 

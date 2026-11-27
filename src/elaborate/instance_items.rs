@@ -193,7 +193,11 @@ pub(super) fn inline_instantiation_items(
                                     .iter()
                                     .map(|it| rewrite_module_item_subst(it, &subst))
                                     .collect();
-                                elaborate_items(&rewritten, elab, Some(definitions))?;
+                                let prev_default_auto = elab.default_automatic;
+                                elab.default_automatic = false;
+                                let checker_res = elaborate_items(&rewritten, elab, Some(definitions));
+                                elab.default_automatic = prev_default_auto;
+                                checker_res?;
                             }
                         }
                         continue;
@@ -1488,8 +1492,7 @@ pub(super) fn inline_instantiation_items(
                                                                 matches!(s, Signing::Signed);
                                                         }
                                                     } else if is_string_data_type(data_type) {
-                                                        val =
-                                                            Value::from_string(&val.to_sv_string());
+                                                        val = val.sv_string_strip_nul();
                                                     } else {
                                                         // §5.7.1/§10.9: a DECLARED
                                                         // shape sizes the init —
@@ -2374,11 +2377,29 @@ pub(super) fn inline_instantiation_items(
                     for _ in 0..3 {
                         for it in body_items.iter().map(|c| &**c) {
                             if let ModuleItem::TypedefDeclaration(td) = it {
-                                let w = resolve_type_width(
+                                let w = if let Some(res) = interface_ports::resolve_interface_port_typedef(
+                                    td,
+                                    sub_mod.ports(),
+                                    sub_mod.items(),
+                                    &sub_local_params,
+                                    &sub_interface_map,
+                                    elab,
+                                    Some(definitions),
+                                ) {
+                                    res.width
+                                } else if let Some(res) = resolve_specialized_class_data_type(
                                     &td.data_type,
-                                    Some(&sub_local_params),
-                                    Some(&elab.typedefs),
-                                );
+                                    &sub_local_params,
+                                    elab,
+                                ) {
+                                    res.width
+                                } else {
+                                    resolve_type_width(
+                                        &td.data_type,
+                                        Some(&sub_local_params),
+                                        Some(&elab.typedefs),
+                                    )
+                                };
                                 saved_tds
                                     .entry(td.name.name.clone())
                                     .or_insert_with(|| elab.typedefs.get(&td.name.name).copied());
@@ -2406,7 +2427,27 @@ pub(super) fn inline_instantiation_items(
                     }
                     for it in body_items.iter().map(|c| &**c) {
                         if let ModuleItem::TypedefDeclaration(td) = it {
-                            local_types.insert(td.name.name.clone(), td.data_type.clone());
+                            let resolved_dt = if let Some(res) =
+                                interface_ports::resolve_interface_port_typedef(
+                                    td,
+                                    sub_mod.ports(),
+                                    sub_mod.items(),
+                                    &sub_local_params,
+                                    &sub_interface_map,
+                                    elab,
+                                    Some(definitions),
+                                ) {
+                                res.data_type
+                            } else if let Some(res) = resolve_specialized_class_data_type(
+                                &td.data_type,
+                                &sub_local_params,
+                                elab,
+                            ) {
+                                res.data_type
+                            } else {
+                                td.data_type.clone()
+                            };
+                            local_types.insert(td.name.name.clone(), resolved_dt);
                         }
                     }
                     // 2. Parameters from module items
@@ -2767,42 +2808,39 @@ pub(super) fn inline_instantiation_items(
                             if prepared_sub.interface_ports.contains(&port.name.name) {
                                 continue;
                             }
-                            let width = port
-                                .data_type
+                            if let (Some(nt), Some(dt)) = (port.net_type, port.data_type.as_ref()) {
+                                check_net_port_data_type(nt, dt, port.span, elab, Some(sub_mod.name()))?;
+                            }
+                            let port_spec = port.data_type.as_ref().and_then(|dt| {
+                                resolve_specialized_class_data_type(dt, &sub_merged_params, elab)
+                            });
+                            let eff_port_dt: Option<&DataType> = port_spec
                                 .as_ref()
-                                .map(|dt| {
-                                    resolve_type_width(
-                                        dt,
-                                        Some(&sub_merged_params),
-                                        Some(&elab.typedefs),
-                                    )
+                                .map(|r| &r.data_type)
+                                .or(port.data_type.as_ref());
+                            let width = port_spec
+                                .as_ref()
+                                .map(|r| r.width)
+                                .or_else(|| {
+                                    port.data_type.as_ref().map(|dt| {
+                                        resolve_type_width(
+                                            dt,
+                                            Some(&sub_merged_params),
+                                            Some(&elab.typedefs),
+                                        )
+                                    })
                                 })
                                 .unwrap_or(1);
                             let sig_name = cat2(&inst_prefix, &port.name.name);
-                            // §6.6.7: resolve REALNESS through the typedef
-                            // table — a nettype port formal (`inout rnet p`,
-                            // rnet = `nettype real`) is a real signal. The
-                            // bare is_type_real left it integral, so `%f` on
-                            // the formal printed raw bits and a real consumer
-                            // through it could read 0.0.
-                            let is_real = port
-                                .data_type
-                                .as_ref()
+                            let is_real = eff_port_dt
                                 .map(|dt| is_type_real_resolved(dt, &elab.typedef_types))
                                 .unwrap_or(false);
-                            // §6.18: the port's unpacked dimensions may come
-                            // from its TYPEDEF (`typedef t_byte t_word [0:3];
-                            // input t_word din;`), not the declarator. The
-                            // TOP-module path consults typedef_unpacked_dims
-                            // for exactly this; here only `port.dimensions`
-                            // was used, so an INLINED child's typedef-array
-                            // port registered as a plain scalar — the array
-                            // never existed, its connection silently carried
-                            // nothing, and (under `default_nettype none`) the
-                            // actual was then reported as an implicit net
-                            // (GitHub xezim#106).
                             let effective_port_dims: Vec<UnpackedDimension> =
-                                if port.dimensions.is_empty() {
+                                if let Some(spec) = &port_spec {
+                                    let mut d = port.dimensions.clone();
+                                    d.extend(spec.unpacked_dims.iter().cloned());
+                                    d
+                                } else if port.dimensions.is_empty() {
                                     match port.data_type.as_ref() {
                                         Some(DataType::TypeReference { name, .. }) => {
                                             lookup_scoped_type(name, &elab.typedef_unpacked_dims)
@@ -2831,19 +2869,7 @@ pub(super) fn inline_instantiation_items(
                                     elab.descending_arrays.insert(sig_name.clone());
                                 }
                             }
-                            // Register the packed-struct field layout for a
-                            // struct-typed port so a member write to the port's
-                            // internal signal (`dut.out.a` for an `output
-                            // sample_t out`) resolves the field — otherwise the
-                            // write was dropped and the output stayed X.
-                            //
-                            // §7.2: not for an UNPACKED struct, which is stored
-                            // member-wise (see `register_unpacked_aggregate`
-                            // below) like the root arm's ports. A layout there
-                            // sent the child's own process writes (`o = '{..}`,
-                            // `o.a = v`) into slices of the width-only
-                            // container, which the parent never reads.
-                            if let Some(dt) = &port.data_type {
+                            if let Some(dt) = eff_port_dt {
                                 let mut struct_w: u32 = 0;
                                 let member_wise = inlined_port_member_wise(
                                     dt,
@@ -3046,7 +3072,7 @@ pub(super) fn inline_instantiation_items(
                                     elab,
                                     &sig_name,
                                     net_type,
-                                    port.data_type.as_ref(),
+                                    eff_port_dt,
                                 );
                             }
                             if port_shape.is_empty() {
@@ -3057,7 +3083,7 @@ pub(super) fn inline_instantiation_items(
                                 // A member-wise one also records its declared
                                 // type, as the root arm does: the procedural
                                 // struct copy and `%p` look it up there.
-                                if let Some(dt) = &port.data_type {
+                                if let Some(dt) = eff_port_dt {
                                     register_unpacked_aggregate(elab, &sig_name, dt);
                                     if inlined_port_member_wise(
                                         dt,
@@ -3109,6 +3135,26 @@ pub(super) fn inline_instantiation_items(
                                     }
                                     _ => None,
                                 };
+                                let port_type_name = port
+                                    .data_type
+                                    .as_ref()
+                                    .and_then(|dt| {
+                                        declared_user_nettype(elab, dt)
+                                            .or_else(|| get_type_name(dt))
+                                    })
+                                    .map(SharedName::from);
+                                let sig_val = init_val.unwrap_or_else(|| {
+                                    default_port_value(
+                                        port.direction,
+                                        eff_port_dt,
+                                        width,
+                                        is_real,
+                                        ansi_port_net_type(port),
+                                    )
+                                });
+                                let sig_signed = eff_port_dt
+                                    .map(|dt| is_type_signed_resolved(dt, &elab.typedef_types))
+                                    .unwrap_or(false);
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3117,27 +3163,11 @@ pub(super) fn inline_instantiation_items(
                                         is_const: false,
                                         name: sig_name.clone().into(),
                                         width,
-                                        is_signed: port
-                                            .data_type
-                                            .as_ref()
-                                            .map(|dt| is_type_signed_resolved(dt, &elab.typedef_types))
-                                            .unwrap_or(false),
+                                        is_signed: sig_signed,
                                         is_real,
                                         direction: port.direction,
-                                        value: init_val.unwrap_or_else(|| {
-                                            default_port_value(
-                                                port.direction,
-                                                port.data_type.as_ref(),
-                                                width,
-                                                is_real,
-                                                ansi_port_net_type(port),
-                                            )
-                                        }).into(),
-                                        type_name: port
-                                            .data_type
-                                            .as_ref()
-                                            .and_then(get_type_name)
-                                            .map(SharedName::from),
+                                        value: sig_val.into(),
+                                        type_name: port_type_name,
                                     },
                                 );
                             } else {
@@ -3146,12 +3176,11 @@ pub(super) fn inline_instantiation_items(
                                     &sig_name,
                                     &port_shape,
                                     width,
-                                    port.data_type
-                                        .as_ref()
-                                        .map(is_type_two_state)
+                                    eff_port_dt
+                                        .map(|dt| is_type_two_state_resolved(dt, &elab.typedef_types))
                                         .unwrap_or(false),
                                 );
-                                if let Some(dt) = &port.data_type {
+                                if let Some(dt) = eff_port_dt {
                                     if matches!(
                                         port.direction,
                                         Some(PortDirection::Input | PortDirection::Inout)
@@ -3162,7 +3191,7 @@ pub(super) fn inline_instantiation_items(
                                         sig_name,
                                         instance_decl_type(
                                             &mut cache.decl_types,
-                                            &dt,
+                                            dt,
                                             &sub_typedef_names_all,
                                             &inst_prefix,
                                             sub_mod.name(),
@@ -3181,7 +3210,74 @@ pub(super) fn inline_instantiation_items(
                 iprof_since("ck4_before_loopB", __th);
                 for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
-                        if let DataType::Enum(et) = &td.data_type {
+                        if let Some(res) = interface_ports::resolve_interface_port_typedef(
+                            td,
+                            sub_mod.ports(),
+                            sub_mod.items(),
+                            &sub_merged_params,
+                            &sub_interface_map,
+                            elab,
+                            Some(definitions),
+                        ) {
+                            let scoped = cat2(&inst_prefix, &td.name.name);
+                            saved_type_binds.push((
+                                td.name.name.clone(),
+                                elab.typedefs.get(&td.name.name).copied(),
+                                elab.typedef_types
+                                    .get(&td.name.name)
+                                    .cloned()
+                                    .or_else(|| Some(res.data_type.clone())),
+                            ));
+                            typedefs_insert_traced(
+                                &mut elab.typedefs,
+                                "insert:submodule_interface_typedef",
+                                td.name.name.clone(),
+                                res.width,
+                            );
+                            typedefs_insert_traced(
+                                &mut elab.typedefs,
+                                "insert:submodule_interface_typedef_scoped",
+                                scoped.clone(),
+                                res.width,
+                            );
+                            if let Some(ew) = res.elem_width {
+                                elab.typedef_elem_widths.insert(td.name.name.clone(), ew);
+                                elab.typedef_elem_widths.insert(scoped.clone(), ew);
+                            }
+                            elab.typedef_types
+                                .insert(td.name.name.clone(), res.data_type.clone());
+                            elab.typedef_types.entry(scoped.clone()).or_insert_with(|| {
+                                scope_local_typerefs(
+                                    &res.data_type,
+                                    &sub_typedef_names_all,
+                                    &inst_prefix,
+                                )
+                            });
+                            if !res.enum_members.is_empty() {
+                                let ordered: Vec<(String, u64)> = res
+                                    .enum_members
+                                    .iter()
+                                    .map(|(nm, val, _)| (nm.clone(), *val))
+                                    .collect();
+                                elab.enum_members.insert(scoped.clone(), ordered.clone());
+                                elab.enum_members
+                                    .entry(td.name.name.clone())
+                                    .or_insert(ordered);
+                            }
+                            saved_unpacked_dims.push((
+                                td.name.name.clone(),
+                                elab.typedef_unpacked_dims.get(&td.name.name).cloned(),
+                            ));
+                            if res.unpacked_dims.is_empty() {
+                                elab.typedef_unpacked_dims.remove(&td.name.name);
+                            } else {
+                                elab.typedef_unpacked_dims
+                                    .insert(td.name.name.clone(), res.unpacked_dims.clone());
+                                elab.typedef_unpacked_dims.insert(scoped, res.unpacked_dims);
+                            }
+                        } else if let DataType::Enum(et) = &td.data_type {
+                            let enum_signed =
+                                is_type_signed_resolved(&td.data_type, &elab.typedef_types);
                             let base_width = et
                                 .base_type
                                 .as_ref()
@@ -3193,9 +3289,6 @@ pub(super) fn inline_instantiation_items(
                                     )
                                 })
                                 .unwrap_or(32);
-                            let mut next_val: u64 = 0;
-                            let wide_vals = (base_width > 64)
-                                .then(|| wide_enum_value_map(et, base_width, &sub_merged_params));
                             // §6.19.6: the member LIST of this instance's enum,
                             // for `.name()/.first()/.num()` on its variables.
                             // Submodule enums never reach `process_typedef`, so
@@ -3204,19 +3297,13 @@ pub(super) fn inline_instantiation_items(
                             // by-value scan (a sibling's `PB` for our `SB`),
                             // and `.num()` read 0.
                             let mut inst_members: Vec<(String, u64)> = Vec::new();
-                            for member in &et.members {
-                                let val = if let Some(init) = &member.init {
-                                    eval_const_expr(init, &sub_merged_params)
-                                } else {
-                                    next_val
-                                };
-                                next_val = val.wrapping_add(1);
-                                inst_members.push((member.name.name.clone(), val));
-                                let v = wide_vals
-                                    .as_ref()
-                                    .and_then(|m| m.get(&member.name.name))
-                                    .cloned()
-                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
+                            for (nm, val, v) in enums::enum_members_values(
+                                et,
+                                base_width,
+                                enum_signed,
+                                &sub_merged_params,
+                            ) {
+                                inst_members.push((nm.clone(), val));
                                 // Don't clobber an already-registered member
                                 // with a DIFFERENT value: xezim's parameter
                                 // namespace is flat, but per LRM §22.1.4 +
@@ -3231,24 +3318,27 @@ pub(super) fn inline_instantiation_items(
                                 // `prefetch_state_e::IDLE`=0 / `rvvi_c_e::IDLE`=0,
                                 // and every other module's `case` arm that
                                 // references IDLE matches the wrong arm.
-                                let prior = elab.parameters.get(&member.name.name).cloned();
+                                let prior = elab.parameters.get(&nm).cloned();
                                 let should_insert = match &prior {
                                     None => true,
+                                    Some(p) if v.has_xz() || p.has_xz() => {
+                                        p.width == v.width && p.case_eq(&v).to_u64() == Some(1)
+                                    }
                                     Some(p) => p.to_u64() == Some(val),
                                 };
                                 if should_insert {
-                                    elab.set_param(line!(), member.name.name.clone(), v.clone());
+                                    elab.set_param(line!(), nm.clone(), v.clone());
                                     signals_insert_traced(
                                         &mut elab.signals,
                                         line!(),
-                                        member.name.name.clone(),
+                                        nm.clone(),
                                         Signal {
                                             is_const: false,
-                                            name: member.name.name.clone().into(),
+                                            name: nm.clone().into(),
                                             width: base_width,
-                                            is_signed: false,
+                                            is_signed: enum_signed,
                                             direction: None,
-                                            value: v.into(),
+                                            value: v.clone().into(),
                                             type_name: None,
                                             is_real: false,
                                         },
@@ -3265,13 +3355,8 @@ pub(super) fn inline_instantiation_items(
                                 // so the scoped entry wins where it matters
                                 // and the bare slot stays the design-wide
                                 // §23.6 fallback.
-                                let sc = cat2(&inst_prefix, &member.name.name);
-                                let sv = wide_vals
-                                    .as_ref()
-                                    .and_then(|m| m.get(&member.name.name))
-                                    .cloned()
-                                    .unwrap_or_else(|| Value::from_u64(val, base_width));
-                                elab.set_param(line!(), sc.clone(), sv.clone());
+                                let sc = cat2(&inst_prefix, &nm);
+                                elab.set_param(line!(), sc.clone(), v.clone());
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3280,9 +3365,9 @@ pub(super) fn inline_instantiation_items(
                                         is_const: false,
                                         name: sc.into(),
                                         width: base_width,
-                                        is_signed: false,
+                                        is_signed: enum_signed,
                                         direction: None,
-                                        value: sv.into(),
+                                        value: v.into(),
                                         type_name: None,
                                         is_real: false,
                                     },
@@ -3336,42 +3421,30 @@ pub(super) fn inline_instantiation_items(
                                     )
                                 });
                         } else {
-                            let w = resolve_type_width(
+                            let spec_res = resolve_specialized_class_data_type(
                                 &td.data_type,
-                                Some(&sub_merged_params),
-                                Some(&elab.typedefs),
+                                &sub_merged_params,
+                                elab,
                             );
-                            // The BARE key must hold this module's local
-                            // typedef only for the DURATION of this instance's
-                            // inlining (its own body and children resolve it),
-                            // then restore: leaving it permanently clobbered
-                            // the $unit/global entry, so a LATER module with
-                            // no local `t` sized its `t v;` from whichever
-                            // instance inlined last (order-dependent 64 vs 16).
-                            // Same save/restore rail the type-parameter
-                            // overrides use.
-                            // The TYPE slot is prior-or-KEEP: the saved value
-                            // is what the slot held before this instance — or,
-                            // for the FIRST instance, this instance's own type
-                            // — so the restore hands post-inlining consumers
-                            // (the struct-member machinery reads the bare slot
-                            // AFTER inlining; removing it broke every
-                            // struct-typed member) the same first-declared
-                            // fallback as before, while the overwrite below
-                            // makes the slot context-correct DURING inlining.
-                            // With first-wins (`entry().or_insert`) here, a
-                            // second differently-parameterized instance
-                            // resolved its `#(.T(rec_t))` overrides and its
-                            // own member writes through the FIRST instance's
-                            // baked layout — 39-bit field offsets in a 68-bit
-                            // struct, order-dependent on instance order.
+                            let eff_td_dt: &DataType =
+                                spec_res.as_ref().map_or(&td.data_type, |r| &r.data_type);
+                            let w = spec_res.as_ref().map_or_else(
+                                || {
+                                    resolve_type_width(
+                                        &td.data_type,
+                                        Some(&sub_merged_params),
+                                        Some(&elab.typedefs),
+                                    )
+                                },
+                                |r| r.width,
+                            );
                             saved_type_binds.push((
                                 td.name.name.clone(),
                                 elab.typedefs.get(&td.name.name).copied(),
                                 elab.typedef_types
                                     .get(&td.name.name)
                                     .cloned()
-                                    .or_else(|| Some(td.data_type.clone())),
+                                    .or_else(|| Some(eff_td_dt.clone())),
                             ));
                             typedefs_insert_traced(
                                 &mut elab.typedefs,
@@ -3386,15 +3459,8 @@ pub(super) fn inline_instantiation_items(
                                 cat2(&inst_prefix, &td.name.name),
                                 w,
                             );
-                            // Packed ELEMENT width, both keys, mirroring the
-                            // width entries: the bytecode compiler's packed
-                            // element splice/extract on typedef'd locals
-                            // resolves through this table, and a submodule
-                            // typedef recorded only its total width, so a
-                            // `y[i] = …` on a packed-of-packed local bailed
-                            // to the 1-bit select path.
                             if let Some(ew) = packed_inner_elem_width(
-                                &td.data_type,
+                                eff_td_dt,
                                 &sub_merged_params,
                                 &elab.typedefs,
                             ) {
@@ -3402,35 +3468,46 @@ pub(super) fn inline_instantiation_items(
                                 elab.typedef_elem_widths
                                     .insert(cat2(&inst_prefix, &td.name.name), ew);
                             }
-                            // Register the TYPE too (not just its width) so a
-                            // struct/union member access (`s.m0`) on a submodule
-                            // variable of this typedef can resolve to its bit
-                            // layout. Only the width was recorded before, so
-                            // `flatten_struct_fields` below found nothing and the
-                            // member cont-assign was silently dropped (struct
-                            // stayed X). Plain insert: THIS instance's type,
-                            // for the duration of its inlining (see the rail
-                            // comment above); first-declared still wins the
-                            // post-inlining fallback via the restore.
                             elab.typedef_types
-                                .insert(td.name.name.clone(), td.data_type.clone());
+                                .insert(td.name.name.clone(), eff_td_dt.clone());
                             elab.typedef_types
                                 .entry(cat2(&inst_prefix, &td.name.name))
                                 .or_insert_with(|| {
                                     scope_local_typerefs(
-                                        &td.data_type,
+                                        eff_td_dt,
                                         &sub_typedef_names_all,
                                         &inst_prefix,
                                     )
                                 });
-                            // §6.18/§7.4: its UNPACKED dimensions under the
-                            // instance-scoped key as well, which is what this
-                            // instance's subroutine signatures name. Missing,
-                            // a function returning `typedef u8_t u8a_t [0:7]`
-                            // returned one element and `f = mk(v)` read x.
+                            if let DataType::Enum(et) = eff_td_dt {
+                                let signed =
+                                    is_type_signed_resolved(eff_td_dt, &elab.typedef_types);
+                                let mems: Vec<(String, u64)> = enums::enum_members_values(
+                                    et,
+                                    w,
+                                    signed,
+                                    &sub_merged_params,
+                                )
+                                .into_iter()
+                                .map(|(nm, val, _)| (nm, val))
+                                .collect();
+                                elab.enum_members
+                                    .insert(cat2(&inst_prefix, &td.name.name), mems.clone());
+                                elab.enum_members
+                                    .entry(td.name.name.clone())
+                                    .or_insert(mems);
+                            }
                             let scoped = cat2(&inst_prefix, &td.name.name);
-                            let mut udims = td.dimensions.clone();
-                            if let DataType::TypeReference {
+                            let mut udims = fold_unpacked_dims(
+                                &td.dimensions,
+                                &sub_merged_params,
+                                &elab.typedef_types,
+                            );
+                            if let Some(spec) = &spec_res
+                                && !spec.unpacked_dims.is_empty()
+                            {
+                                udims.extend(spec.unpacked_dims.iter().cloned());
+                            } else if let DataType::TypeReference {
                                 name, dimensions, ..
                             } = &td.data_type
                                 && dimensions.is_empty()
@@ -3477,45 +3554,75 @@ pub(super) fn inline_instantiation_items(
                 if let PortList::NonAnsi(_) = sub_mod.ports() {
                     for sub_item in &prepared_sub.effective_items {
                         if let ModuleItem::PortDeclaration(pd) = sub_item {
+                            if let Some(nt) = pd.net_type {
+                                check_net_port_data_type(
+                                    nt,
+                                    &pd.data_type,
+                                    pd.span,
+                                    elab,
+                                    Some(sub_mod.name()),
+                                )?;
+                            }
                             if is_interface_type(&pd.data_type, definitions) {
                                 continue;
                             }
+                            let pd_spec = resolve_specialized_class_data_type(
+                                &pd.data_type,
+                                &sub_merged_params,
+                                elab,
+                            );
+                            let eff_pd_dt: &DataType =
+                                pd_spec.as_ref().map_or(&pd.data_type, |r| &r.data_type);
                             if matches!(
-                                resolve_typedef_chain(&pd.data_type, &elab.typedef_types),
+                                resolve_typedef_chain(eff_pd_dt, &elab.typedef_types),
                                 DataType::Simple { kind: SimpleType::String, .. }
                             ) {
                                 string_ports.extend(
                                     pd.declarators.iter().map(|d| d.name.name.as_str()),
                                 );
                             }
-                            if matches!(pd.data_type, DataType::TypeReference { .. })
-                                && is_type_two_state_resolved(&pd.data_type, &elab.typedef_types)
+                            if (pd_spec.is_some()
+                                || matches!(eff_pd_dt, DataType::TypeReference { .. }))
+                                && is_type_two_state_resolved(eff_pd_dt, &elab.typedef_types)
                             {
                                 resolved_two_state_ports.extend(
                                     pd.declarators.iter().map(|d| d.name.name.as_str()),
                                 );
                             }
-                            let width = resolve_type_width(
-                                &pd.data_type,
-                                Some(&sub_local_params),
-                                Some(&elab.typedefs),
+                            let width = pd_spec.as_ref().map_or_else(
+                                || {
+                                    resolve_type_width(
+                                        &pd.data_type,
+                                        Some(&sub_merged_params),
+                                        Some(&elab.typedefs),
+                                    )
+                                },
+                                |r| r.width,
                             );
-                            let is_signed = is_type_signed_resolved(&pd.data_type, &elab.typedef_types);
+                            let is_signed = is_type_signed_resolved(eff_pd_dt, &elab.typedef_types);
                             for decl in &pd.declarators {
                                 let sig_name = cat2(&inst_prefix, &decl.name.name);
-                                let dims = if decl.dimensions.is_empty() {
-                                    match &pd.data_type {
-                                        DataType::TypeReference { name, .. } => {
-                                            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
-                                                .cloned()
-                                                .unwrap_or_default()
+                                let mut dims = if decl.dimensions.is_empty() {
+                                    if let Some(spec) = &pd_spec {
+                                        spec.unpacked_dims.clone()
+                                    } else {
+                                        match &pd.data_type {
+                                            DataType::TypeReference { name, .. } => {
+                                                lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                                    .cloned()
+                                                    .unwrap_or_default()
+                                            }
+                                            _ => Vec::new(),
                                         }
-                                        _ => Vec::new(),
                                     }
                                 } else {
-                                    decl.dimensions.clone()
+                                    let mut d = decl.dimensions.clone();
+                                    if let Some(spec) = &pd_spec {
+                                        d.extend(spec.unpacked_dims.iter().cloned());
+                                    }
+                                    d
                                 };
-                                let dims = normalize_unpacked_dims(
+                                dims = normalize_unpacked_dims(
                                     &dims,
                                     &sub_local_params,
                                     &elab.typedef_types,
@@ -3523,15 +3630,14 @@ pub(super) fn inline_instantiation_items(
                                 if let Some(shape) = fixed_unpacked_shape(&dims, &sub_local_params)
                                     .filter(|d| !d.is_empty())
                                 {
+                                    let pd_two_state =
+                                        is_type_two_state_resolved(eff_pd_dt, &elab.typedef_types);
                                     register_fixed_unpacked_array(
                                         elab,
                                         &sig_name,
                                         &shape,
                                         width,
-                                        is_type_two_state_resolved(
-                                            &pd.data_type,
-                                            &elab.typedef_types,
-                                        ),
+                                        pd_two_state,
                                     );
                                     if let Some(declared) =
                                         declared_unpacked_dims(&dims, &sub_local_params)
@@ -3545,14 +3651,14 @@ pub(super) fn inline_instantiation_items(
                                         sig_name.clone(),
                                         instance_decl_type(
                                             &mut cache.decl_types,
-                                            &pd.data_type,
+                                            eff_pd_dt,
                                             &sub_typedef_names_all,
                                             &inst_prefix,
                                             sub_mod.name(),
                                         ),
                                     );
                                 } else if names_packed_array_or_struct(
-                                    &pd.data_type,
+                                    eff_pd_dt,
                                     &elab.typedef_types,
                                 ) && !elab.var_decl_types.contains_key(&sig_name)
                                 {
@@ -3564,70 +3670,50 @@ pub(super) fn inline_instantiation_items(
                                         sig_name.clone(),
                                         instance_decl_type(
                                             &mut cache.decl_types,
-                                            &pd.data_type,
+                                            eff_pd_dt,
                                             &sub_typedef_names_all,
                                             &inst_prefix,
                                             sub_mod.name(),
                                         ),
                                     );
                                 }
-                                // §7.4.1: a non-ANSI PORT of a packed
-                                // multi-D / packed-struct type needs the
-                                // same shape registrations a variable
-                                // declaration gets. Without them
-                                // `assign o[1] = v;` on a
-                                // `output logic [3:0][9:0] o;` inlined
-                                // port degraded to a bit-window write, and
-                                // struct-port member assigns lost the
-                                // layout.
                                 if let Some(ew) = packed_inner_elem_width(
-                                    &pd.data_type,
+                                    eff_pd_dt,
                                     &sub_local_params,
                                     &elab.typedefs,
                                 )
                                 .or_else(|| {
                                     // Dims on the TYPEDEF (`output w_t o;`).
-                                    let one =
-                                        bare_typedef_step(&pd.data_type, &elab.typedef_types)?;
+                                    let one = bare_typedef_step(eff_pd_dt, &elab.typedef_types)?;
                                     packed_inner_elem_width(&one, &sub_local_params, &elab.typedefs)
                                 }) {
                                     elab.packed_signal_elem_widths
                                         .entry(sig_name.clone())
                                         .or_insert(ew);
                                 }
-                                // §7.4.1: a TYPEDEF'd element with
-                                // declared dims (`output u8_t [0:7] o;`)
-                                // chains them with the typedef's, as the
-                                // ANSI arm does; unrecorded, ascending
-                                // `[0:7]` fell back to [7:0] order.
                                 if let Some(fd) =
-                                    packed_full_dims_of(&pd.data_type, &sub_local_params).or_else(
-                                        || {
-                                            packed_full_dims_chained(
-                                                &pd.data_type,
-                                                &sub_local_params,
-                                                &elab.typedef_types,
-                                            )
-                                        },
-                                    )
+                                    packed_full_dims_of(eff_pd_dt, &sub_local_params).or_else(|| {
+                                        packed_full_dims_chained(
+                                            eff_pd_dt,
+                                            &sub_local_params,
+                                            &elab.typedef_types,
+                                        )
+                                    })
                                 {
                                     elab.packed_full_dims
                                         .insert_if_absent(sig_name.clone(), || fd);
                                 }
                                 if let Some(fields) = packed_struct_field_layout(
-                                    &pd.data_type,
+                                    eff_pd_dt,
                                     &sub_local_params,
                                     &elab.typedefs,
                                     &elab.typedef_types,
                                 ) {
                                     if !fields.is_empty() {
-                                        // §7.4.1: a packed ARRAY of the struct
-                                        // (`output s_t [0:3] o;`), as the ANSI
-                                        // arm records it.
                                         let struct_w =
                                             fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
                                         if let Some(fd) = packed_typedef_array_dims(
-                                            &pd.data_type,
+                                            eff_pd_dt,
                                             struct_w,
                                             &sub_local_params,
                                         ) {
@@ -3639,26 +3725,25 @@ pub(super) fn inline_instantiation_items(
                                         elab.packed_struct_fields
                                             .entry(sig_name.clone())
                                             .or_insert(fields);
-                                        // §7.2, §7.4.1: its members' shapes,
-                                        // as the top-level port arm records.
                                         register_member_packed_meta(
                                             elab,
                                             &sig_name,
-                                            &pd.data_type,
+                                            eff_pd_dt,
                                             Some(&sub_local_params),
                                         );
                                     }
                                 }
-                                // §6.6.7: resolve REALNESS through the
-                                // typedef table — a nettype port formal
-                                // (`inout rnet p`, rnet = `nettype real`)
-                                // is a real signal. The bare is_type_real
-                                // left it integral, so `%f` on the formal
-                                // printed raw bits and any true real
-                                // consumer read 0.0 (reads only worked
-                                // when both sides were bit-identical).
                                 let port_is_real =
-                                    is_type_real_resolved(&pd.data_type, &elab.typedef_types);
+                                    is_type_real_resolved(eff_pd_dt, &elab.typedef_types);
+                                let pd_type_name = declared_user_nettype(elab, eff_pd_dt)
+                                    .map(SharedName::from)
+                                    .or_else(|| {
+                                        scope_local_type_name(
+                                            get_type_name(eff_pd_dt),
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        )
+                                    });
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3671,17 +3756,13 @@ pub(super) fn inline_instantiation_items(
                                         direction: Some(pd.direction),
                                         value: default_port_value(
                                             Some(pd.direction),
-                                            Some(&pd.data_type),
+                                            Some(eff_pd_dt),
                                             width,
                                             port_is_real,
                                             port_decl_net_type(pd),
                                         ).into(),
                                         is_real: port_is_real,
-                                        type_name: scope_local_type_name(
-                                            get_type_name(&pd.data_type),
-                                            &sub_typedef_names_all,
-                                            &inst_prefix,
-                                        ),
+                                        type_name: pd_type_name,
                                     },
                                 );
                                 if let Some(net_type) = port_decl_net_type(pd) {
@@ -3689,16 +3770,11 @@ pub(super) fn inline_instantiation_items(
                                         elab,
                                         &sig_name,
                                         net_type,
-                                        Some(&pd.data_type),
+                                        Some(eff_pd_dt),
                                     );
                                 }
-                                // §6.11.2: as for an ANSI port, a 2-state
-                                // formal drops X and Z on every write.
                                 if !port_is_real
-                                    && is_type_two_state_resolved(
-                                        &pd.data_type,
-                                        &elab.typedef_types,
-                                    )
+                                    && is_type_two_state_resolved(eff_pd_dt, &elab.typedef_types)
                                 {
                                     elab.two_state_signals.insert(sig_name.clone());
                                 }
@@ -3710,10 +3786,36 @@ pub(super) fn inline_instantiation_items(
                 for sub_item in &prepared_sub.effective_items {
                     match sub_item {
                         ModuleItem::NetDeclaration(nd) => {
-                            let width = resolve_type_width(
+                            check_net_data_type_in(nd, elab, Some(sub_mod.name()))?;
+                            let nd_spec = resolve_specialized_class_data_type(
                                 &nd.data_type,
-                                Some(&sub_merged_params),
-                                Some(&elab.typedefs),
+                                &sub_merged_params,
+                                elab,
+                            );
+                            let nd_eff_owned;
+                            let nd = if let Some(spec) = &nd_spec {
+                                let mut cloned = nd.clone();
+                                cloned.data_type = spec.data_type.clone();
+                                if !spec.unpacked_dims.is_empty() {
+                                    for decl in &mut cloned.declarators {
+                                        decl.dimensions
+                                            .extend(spec.unpacked_dims.iter().cloned());
+                                    }
+                                }
+                                nd_eff_owned = cloned;
+                                &nd_eff_owned
+                            } else {
+                                nd
+                            };
+                            let width = nd_spec.as_ref().map_or_else(
+                                || {
+                                    resolve_type_width(
+                                        &nd.data_type,
+                                        Some(&sub_merged_params),
+                                        Some(&elab.typedefs),
+                                    )
+                                },
+                                |r| r.width,
                             );
                             for decl in &nd.declarators {
                                 let sig_name = cat2(&inst_prefix, &decl.name.name);
@@ -3917,6 +4019,17 @@ pub(super) fn inline_instantiation_items(
                                     );
                                 }
                                 let init_value = default_net_value(nd.net_type, width, net_is_real);
+                                let nd_is_signed =
+                                    is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
+                                let nd_type_name = declared_user_nettype(elab, &nd.data_type)
+                                    .map(SharedName::from)
+                                    .or_else(|| {
+                                        scope_local_type_name(
+                                            get_type_name(&nd.data_type),
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                        )
+                                    });
                                 signals_insert_traced(
                                     &mut elab.signals,
                                     line!(),
@@ -3925,7 +4038,7 @@ pub(super) fn inline_instantiation_items(
                                         is_const: false,
                                         name: sig_name.into(),
                                         width,
-                                        is_signed: is_type_signed_resolved(&nd.data_type, &elab.typedef_types),
+                                        is_signed: nd_is_signed,
                                         // Resolved through the typedef table so a
                                         // NETTYPE net declared in a submodule
                                         // (`rnet n;`) is real like its top-level
@@ -3933,11 +4046,7 @@ pub(super) fn inline_instantiation_items(
                                         is_real: net_is_real,
                                         direction: None,
                                         value: init_value.into(),
-                                        type_name: scope_local_type_name(
-                                            get_type_name(&nd.data_type),
-                                            &sub_typedef_names_all,
-                                            &inst_prefix,
-                                        ),
+                                        type_name: nd_type_name,
                                     },
                                 );
                             }
@@ -3964,12 +4073,27 @@ pub(super) fn inline_instantiation_items(
                                     }
                                 }
                             }
-                            // Anonymous enum on a variable decl in a
-                            // submodule's items (e.g. cv32e40p_obi_interface's
-                            // state_q FSM): mirror the top-level DataDecl
-                            // arm so enum members resolve as constants in
-                            // submodule scopes too.
                             register_anonymous_enum_members(&dd.data_type, elab);
+                            let dd_spec = resolve_specialized_class_data_type(
+                                &dd.data_type,
+                                &sub_merged_params,
+                                elab,
+                            );
+                            let dd_eff_owned;
+                            let dd = if let Some(spec) = &dd_spec {
+                                let mut cloned = dd.clone();
+                                cloned.data_type = spec.data_type.clone();
+                                if !spec.unpacked_dims.is_empty() {
+                                    for decl in &mut cloned.declarators {
+                                        decl.dimensions
+                                            .extend(spec.unpacked_dims.iter().cloned());
+                                    }
+                                }
+                                dd_eff_owned = cloned;
+                                &dd_eff_owned
+                            } else {
+                                dd
+                            };
                             // ALSO register the members under the fully-
                             // scoped instance name (e.g.
                             // `dut_wrap...alu_div_i.FINISH`) so a local
@@ -4303,31 +4427,32 @@ pub(super) fn inline_instantiation_items(
                                     }
                                 }
                             }
-                            let width = match &dd.data_type {
-                                // Packed dims on the reference (`some_t [1:0] g`)
-                                // multiply the typedef's width — the bare-typedef
-                                // shortcut is only valid without them. Taking it
-                                // anyway sized a two-element struct array at ONE
-                                // element, so the second element's writes were
-                                // clamped away and it read X (the top-level arms
-                                // already carry this exact guard).
-                                DataType::TypeReference {
-                                    name, dimensions, ..
-                                } if dimensions.is_empty() => {
-                                    elab.typedefs.get(&name.name.name).copied().unwrap_or(
-                                        resolve_type_width(
-                                            &dd.data_type,
-                                            Some(&sub_merged_params),
-                                            Some(&elab.typedefs),
-                                        ),
-                                    )
-                                }
-                                _ => resolve_type_width(
-                                    &dd.data_type,
-                                    Some(&sub_merged_params),
-                                    Some(&elab.typedefs),
-                                ),
-                            };
+                            let width = dd_spec.as_ref().map_or_else(
+                                || match &dd.data_type {
+                                    DataType::TypeReference {
+                                        name, dimensions, ..
+                                    } if dimensions.is_empty() => {
+                                        specialized_class_scope_width(name, &elab)
+                                            .or_else(|| {
+                                                lookup_scoped_type(name, &elab.typedefs).copied()
+                                            })
+                                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                                            .unwrap_or_else(|| {
+                                                resolve_type_width(
+                                                    &dd.data_type,
+                                                    Some(&sub_merged_params),
+                                                    Some(&elab.typedefs),
+                                                )
+                                            })
+                                    }
+                                    _ => resolve_type_width(
+                                        &dd.data_type,
+                                        Some(&sub_merged_params),
+                                        Some(&elab.typedefs),
+                                    ),
+                                },
+                                |r| r.width,
+                            );
                             let is_signed =
                                 is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                             // §7.4.1: packed dims that live on the TYPEDEF
@@ -4447,6 +4572,15 @@ pub(super) fn inline_instantiation_items(
                                         !matches!(dd.data_type, DataType::Implicit { .. });
                                     let decl_is_real =
                                         is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                                    let dd_type_name = declared_user_nettype(elab, &dd.data_type)
+                                        .map(SharedName::from)
+                                        .or_else(|| {
+                                            scope_local_type_name(
+                                                get_type_name(&dd.data_type),
+                                                &sub_typedef_names_all,
+                                                &inst_prefix,
+                                            )
+                                        });
                                     let existing = elab.signals.get_mut(&sig_name).unwrap();
                                     if explicit_type {
                                         if let Some(pats) = signal_trace_patterns() {
@@ -4466,11 +4600,7 @@ pub(super) fn inline_instantiation_items(
                                         existing.width = width;
                                         existing.is_signed = is_signed;
                                         existing.is_real = decl_is_real;
-                                        existing.type_name = scope_local_type_name(
-                                            get_type_name(&dd.data_type),
-                                            &sub_typedef_names_all,
-                                            &inst_prefix,
-                                        );
+                                        existing.type_name = dd_type_name;
                                         existing.value = default_port_value(
                                             existing.direction,
                                             Some(&dd.data_type),
@@ -4805,7 +4935,7 @@ pub(super) fn inline_instantiation_items(
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     if matches!(
-                                        &dd.data_type,
+                                        resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
                                         DataType::Simple {
                                             kind: SimpleType::Event,
                                             ..
@@ -4918,8 +5048,21 @@ pub(super) fn inline_instantiation_items(
                                     // joins the instance's net declaration
                                     // assignments once the rewrite context
                                     // exists.
-                                    let nettype_net = get_type_name(&dd.data_type)
-                                        .is_some_and(|t| elab.nettype_resolvers.contains_key(&t));
+                                    let nettype_net =
+                                        declared_user_nettype(elab, &dd.data_type).is_some();
+                                    if nettype_net {
+                                        if let DataType::TypeReference { type_args, .. } =
+                                            &dd.data_type
+                                            && type_args.len() > 1
+                                        {
+                                            return Err(span_error(
+                                                elab,
+                                                dd.span,
+                                                "user-defined nettype declaration permits at most a single delay value (IEEE 1800-2023 §6.6.7)",
+                                            ));
+                                        }
+                                        elab.nets.insert(sig_name.clone());
+                                    }
                                     if nettype_net && let Some(init_expr) = &decl.init {
                                         nettype_decl_inits.push((
                                             decl.name.name.clone(),
@@ -5035,7 +5178,7 @@ pub(super) fn inline_instantiation_items(
                                     // members x, while the same declaration at
                                     // top level worked.
                                     if matches!(
-                                        &dd.data_type,
+                                        resolve_typedef_chain(&dd.data_type, &elab.typedef_types),
                                         DataType::Simple {
                                             kind: SimpleType::Event,
                                             ..
@@ -5063,6 +5206,20 @@ pub(super) fn inline_instantiation_items(
                                     ) {
                                         elab.two_state_signals.insert(sig_name.clone());
                                     }
+                                    let dd_sig_real = is_type_real_resolved(
+                                        &dd.data_type,
+                                        &elab.typedef_types,
+                                    );
+                                    let dd_sig_type_name =
+                                        declared_user_nettype(elab, &dd.data_type)
+                                            .map(SharedName::from)
+                                            .or_else(|| {
+                                                scope_local_type_name(
+                                                    get_type_name(&dd.data_type),
+                                                    &sub_typedef_names_all,
+                                                    &inst_prefix,
+                                                )
+                                            });
                                     signals_insert_traced(
                                         &mut elab.signals,
                                         line!(),
@@ -5083,15 +5240,8 @@ pub(super) fn inline_instantiation_items(
                                                 }
                                                 v
 .into()                                            },
-                                            is_real: is_type_real_resolved(
-                                                &dd.data_type,
-                                                &elab.typedef_types,
-                                            ),
-                                            type_name: scope_local_type_name(
-                                                get_type_name(&dd.data_type),
-                                                &sub_typedef_names_all,
-                                                &inst_prefix,
-                                            ),
+                                            is_real: dd_sig_real,
+                                            type_name: dd_sig_type_name,
                                         },
                                     );
                                 }
@@ -5176,7 +5326,63 @@ pub(super) fn inline_instantiation_items(
                                 // elements of an array shaped before, which
                                 // keeps its shape here.
                                 let element = whole_net_ident_name(parent_expr).is_none();
-                                if element && let Some(dt) = &struct_dt {
+                                let elem_key = element
+                                    .then(|| {
+                                        scope_indexed_flat_name_params(
+                                            parent_expr,
+                                            &elab.parameters,
+                                        )
+                                    })
+                                    .flatten();
+                                if let Some(ek) = elem_key {
+                                    let entry = elab
+                                        .interconnect_elem_types
+                                        .entry(ek.clone())
+                                        .or_insert_with(|| (fw, freal, ftn.clone()));
+                                    if entry.0 <= 1 && !entry.1 && entry.2.is_none()
+                                        && (fw > 1 || freal || ftn.is_some())
+                                    {
+                                        *entry = (fw, freal, ftn.clone());
+                                    }
+                                    if let Some((_, _, ew)) = elab.arrays.get_mut(&an)
+                                        && *ew < fw
+                                    {
+                                        *ew = fw;
+                                    }
+                                    if let Some(dt) = &struct_dt {
+                                        register_unpacked_aggregate(elab, &ek, dt);
+                                    }
+                                    let pfx = format!("{an}[");
+                                    let mut has_real = false;
+                                    let mut has_non_real = false;
+                                    for (k, (_, er, _)) in &elab.interconnect_elem_types {
+                                        if k.starts_with(&pfx) {
+                                            if *er {
+                                                has_real = true;
+                                            } else {
+                                                has_non_real = true;
+                                            }
+                                        }
+                                    }
+                                    if has_real && !has_non_real {
+                                        elab.var_decl_types.insert(
+                                            an.clone(),
+                                            DataType::Real {
+                                                kind: RealType::Real,
+                                                span: Span::new(0, 0),
+                                            },
+                                        );
+                                    } else if has_non_real {
+                                        elab.var_decl_types.insert(
+                                            an.clone(),
+                                            DataType::Implicit {
+                                                signing: None,
+                                                dimensions: Vec::new(),
+                                                span: Span::new(0, 0),
+                                            },
+                                        );
+                                    }
+                                } else if element && let Some(dt) = &struct_dt {
                                     let typeless = elab
                                         .signals
                                         .get(&an)
@@ -5291,6 +5497,21 @@ pub(super) fn inline_instantiation_items(
                                 } else {
                                     dst.value = Value::zero(src.width.max(1)).into();
                                 }
+                            }
+                        } else if let Some(ek) =
+                            scope_indexed_flat_name_params(parent_expr, &elab.parameters)
+                            && let Some((ew, er, etn)) =
+                                elab.interconnect_elem_types.get(&ek).cloned()
+                        {
+                            if let Some(dst) = elab.signals.get_mut(&sub_sig_name) {
+                                dst.width = ew;
+                                dst.is_real = er;
+                                dst.type_name = etn;
+                                dst.value = if er {
+                                    Value::from_f64(0.0).into()
+                                } else {
+                                    Value::zero(ew.max(1)).into()
+                                };
                             }
                         }
                     }

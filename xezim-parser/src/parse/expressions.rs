@@ -1127,6 +1127,7 @@ impl<'a> Parser<'a> {
         match &e.kind {
             ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].selects.is_empty(),
             ExprKind::MemberAccess { expr, .. } => Self::scoped_name_expr(expr),
+            ExprKind::Specialization { base, .. } => Self::scoped_name_expr(base),
             _ => false,
         }
     }

@@ -325,6 +325,10 @@ fn class_member_names(c: &ClassDeclaration, f: &mut dyn FnMut(&str)) {
                 for_each_enum_member(&t.data_type, &mut |n| f(&n.name));
                 f(&t.name.name);
             }
+            ClassItem::Nettype(n) => {
+                for_each_enum_member(&n.data_type, &mut |id| f(&id.name));
+                f(&n.name.name);
+            }
             ClassItem::Parameter(p) => param_names(p, f),
             ClassItem::Class(i) => f(&i.name.name),
             ClassItem::Covergroup(g) => f(&g.name.name),
@@ -925,6 +929,7 @@ impl<'a> Binder<'a> {
                 self.with_pos("typedef", |b| {
                     b.data_type(&mut t.data_type);
                     b.unpacked(&mut t.dimensions);
+                    t.iface_selects.iter_mut().for_each(|e| b.expr(e));
                 });
             }
             ModuleItem::AlwaysConstruct(a) => self.stmt(&mut a.stmt),
@@ -1072,7 +1077,14 @@ impl<'a> Binder<'a> {
             ModuleItem::LetDeclaration(l) => self.with_pos("let", |b| b.let_decl(l)),
             ModuleItem::NettypeDeclaration(n) => self.with_pos("nettype", |b| {
                 b.data_type(&mut n.data_type);
-                if let Some(r) = &n.resolver {
+                for sc in &mut n.resolver_scopes {
+                    for a in &mut sc.type_args {
+                        b.expr(a);
+                    }
+                }
+                if n.resolver_scopes.is_empty()
+                    && let Some(r) = &n.resolver
+                {
                     b.ident(r);
                 }
             }),
@@ -1230,6 +1242,19 @@ impl<'a> Binder<'a> {
                     self.data_type(&mut t.data_type);
                     self.unpacked(&mut t.dimensions);
                 }
+                ClassItem::Nettype(n) => self.with_pos("nettype", |b| {
+                    b.data_type(&mut n.data_type);
+                    for sc in &mut n.resolver_scopes {
+                        for a in &mut sc.type_args {
+                            b.expr(a);
+                        }
+                    }
+                    if n.resolver_scopes.is_empty()
+                        && let Some(r) = &n.resolver
+                    {
+                        b.ident(r);
+                    }
+                }),
                 ClassItem::Parameter(p) => self.parameter(p),
                 ClassItem::Class(i) => self.class(i),
                 ClassItem::Covergroup(g) => self.covergroup(g),

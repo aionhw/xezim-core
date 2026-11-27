@@ -241,6 +241,9 @@ fn class_scope_names(
                 ClassItem::Typedef(t) => {
                     names.insert(t.name.name.clone());
                 }
+                ClassItem::Nettype(t) => {
+                    names.insert(t.name.name.clone());
+                }
                 ClassItem::Class(i) => {
                     names.insert(i.name.name.clone());
                 }

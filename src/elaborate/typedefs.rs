@@ -676,24 +676,27 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             .insert(td.name.name.clone(), members_ordered);
     } else {
         // Non-enum typedef: resolve width from the underlying type.
-        // `$bits(<signal>)` in the dims is prebound against the signal
-        // table first (and the REWRITTEN type is what gets recorded, so
-        // every later resolution agrees).
-        let bound_dt = prebind_type_dims(&td.data_type, elab);
+        // Resolve specialized class typedefs (`C#(W)::word_t`, `C#(T)::pair_t`)
+        // first so sibling class typedefs and type parameters become concrete,
+        // then prebind `$bits(<signal>)` and fold struct/packed dims.
+        let spec_res =
+            resolve_specialized_class_data_type(&td.data_type, &elab.parameters, elab);
+        let raw_dt: &DataType = spec_res.as_ref().map_or(&td.data_type, |r| &r.data_type);
+        let bound_dt = prebind_type_dims(raw_dt, elab);
         let bound_dt = size_struct_member_dims(
-            bound_dt.as_ref().unwrap_or(&td.data_type),
+            bound_dt.as_ref().unwrap_or(raw_dt),
             &elab.parameters,
             &elab.typedef_types,
             true,
         )
         .or(bound_dt);
         let bound_dt = fold_packed_dims_with(
-            bound_dt.as_ref().unwrap_or(&td.data_type),
+            bound_dt.as_ref().unwrap_or(raw_dt),
             &elab.parameters,
             &|_, _| true,
         )
         .or(bound_dt);
-        let eff_dt: &DataType = bound_dt.as_ref().unwrap_or(&td.data_type);
+        let eff_dt: &DataType = bound_dt.as_ref().unwrap_or(raw_dt);
         // A `typedef class foo_pool;` is parsed as a Void placeholder with
         // `forward:false` (a forward CLASS declaration — §6.18). When the same
         // name is later/more-specifically defined as a REAL typedef alias to a
@@ -725,7 +728,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             // the port width-mismatch diagnostic can name the underflowed
             // parameter (`[P:0]` collapses to `[0:0]` in `typedef_types`).
             let mut range_ids: HashMap<String, Vec<String>> = HashMap::default();
-            if let DataType::Struct(su) = &td.data_type {
+            if let DataType::Struct(su) = raw_dt {
                 for m in &su.members {
                     let mut ids: Vec<String> = Vec::new();
                     if let DataType::IntegerVector { dimensions, .. } = &m.data_type {
@@ -756,15 +759,23 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // `typedef A C [2];`) carries the base's unpacked dimensions after its
     // own, and its element type is the base's element type. Recording only
     // the alias's own dimensions made `B v;` a scalar of the element width.
-    let base_dims = match &td.data_type {
-        DataType::TypeReference {
-            name, dimensions, ..
-        } if dimensions.is_empty() && name.qualified() != td.name.name => {
-            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
-                .cloned()
-                .map(|d| (d, lookup_scoped_type(name, &elab.typedef_types).cloned()))
+    let spec_udims =
+        resolve_specialized_class_data_type(&td.data_type, &elab.parameters, elab)
+            .map(|r| r.unpacked_dims)
+            .filter(|d| !d.is_empty());
+    let base_dims = if let Some(sd) = spec_udims {
+        Some((sd, None))
+    } else {
+        match &td.data_type {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } if dimensions.is_empty() && name.qualified() != td.name.name => {
+                lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                    .cloned()
+                    .map(|d| (d, lookup_scoped_type(name, &elab.typedef_types).cloned()))
+            }
+            _ => None,
         }
-        _ => None,
     };
     if let Some((bd, elem)) = base_dims {
         let mut dims = fold_unpacked_dims(&td.dimensions, &elab.parameters, &elab.typedef_types);
@@ -793,5 +804,44 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // Refresh the thread-local typedef snapshot so any subsequent
     // const-eval `$bits(typedef_name)` call sees this typedef (M2).
     type_trace_tls_refresh("process_typedef", &elab.typedefs);
+    sync_typedefs_tls(&elab.typedefs);
+}
+
+/// Register an interface-based typedef (`typedef p.data_t my_t;` or
+/// `typedef p[0].data_t my_t;`) without polluting the caller's parameter table
+/// with enumerator constants from the interface body (§6.18).
+pub(super) fn register_resolved_interface_typedef(
+    td: &TypedefDeclaration,
+    res: interface_ports::ResolvedInterfaceTypedef,
+    elab: &mut ElaboratedModule,
+) {
+    elab.forward_typedef_names.remove(&td.name.name);
+    typedefs_insert_traced(
+        &mut elab.typedefs,
+        "insert:interface_typedef",
+        td.name.name.clone(),
+        res.width,
+    );
+    if let Some(ew) = res.elem_width {
+        elab.typedef_elem_widths.insert(td.name.name.clone(), ew);
+    }
+    elab.typedef_types
+        .insert(td.name.name.clone(), res.data_type.clone());
+    if !res.unpacked_dims.is_empty() {
+        elab.typedef_unpacked_dims
+            .insert(td.name.name.clone(), res.unpacked_dims.clone());
+    } else {
+        elab.typedef_unpacked_dims.remove(&td.name.name);
+    }
+    if !res.enum_members.is_empty() {
+        let ordered: Vec<(String, u64)> = res
+            .enum_members
+            .iter()
+            .map(|(nm, val, _)| (nm.clone(), *val))
+            .collect();
+        elab.enum_members.insert(td.name.name.clone(), ordered);
+    }
+    tls_register_typedef_shape(&td.name.name, &res.data_type, &res.unpacked_dims);
+    type_trace_tls_refresh("interface_typedef", &elab.typedefs);
     sync_typedefs_tls(&elab.typedefs);
 }

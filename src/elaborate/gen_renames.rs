@@ -597,6 +597,7 @@ fn rename_item_decls(item: &ModuleItem) -> ModuleItem {
             gen_rename(td.decl, &mut new_td.name.name);
             new_td.data_type = gen_type(&td.data_type);
             new_td.dimensions = gen_dims(&td.dimensions);
+            new_td.iface_selects = td.iface_selects.iter().map(gen_expr).collect();
             ModuleItem::TypedefDeclaration(new_td)
         }
         ModuleItem::ContinuousAssign(ca) => {
@@ -856,6 +857,9 @@ fn rename_class_refs(c: &mut ClassDeclaration) {
             ClassItem::Typedef(t) => {
                 t.data_type = gen_type(&t.data_type);
                 t.dimensions = gen_dims(&t.dimensions);
+            }
+            ClassItem::Nettype(n) => {
+                n.data_type = gen_type(&n.data_type);
             }
             ClassItem::Parameter(p) => param(p),
             ClassItem::Class(i) => rename_class_refs(i),

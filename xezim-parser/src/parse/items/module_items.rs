@@ -158,6 +158,10 @@ impl<'a> Parser<'a> {
                     .parse_optional_direction()
                     .unwrap_or(PortDirection::Input);
                 let nt = self.parse_optional_net_type();
+                // §6.7.1: a net type keyword shall not be followed directly by `reg`.
+                if nt.is_some() && self.at(TokenKind::KwReg) {
+                    self.error("a net type keyword shall not be followed directly by 'reg' (IEEE 1800-2023 §6.7.1)");
+                }
                 // §23.2.2.1: `input var x;` — optional `var` keyword.
                 let has_var = self.eat(TokenKind::KwVar).is_some();
                 // §23.2.2.3: an `inout` port shall be of a net type — `inout var`
@@ -214,6 +218,14 @@ impl<'a> Parser<'a> {
                     Some(n) => self.wreal_data_type(n, dt, wreal_span),
                     None => dt,
                 };
+                if matches!(nt, Some(NetType::Interconnect)) {
+                    if has_var {
+                        self.error("'interconnect' port cannot specify 'var' (IEEE 1800-2023 §6.7.1)");
+                    }
+                    if !matches!(dt, DataType::Implicit { .. }) {
+                        self.error("'interconnect' net shall not specify an explicit data type (IEEE 1800-2023 §6.7.1)");
+                    }
+                }
                 let decls = self.parse_var_declarator_list();
                 self.expect(TokenKind::Semicolon);
                 Some(ModuleItem::PortDeclaration(PortDeclaration {
@@ -1231,23 +1243,8 @@ impl<'a> Parser<'a> {
                 self.parse_let_declaration(),
             ))),
             TokenKind::KwNettype => {
-                let start = self.current_span().start;
-                self.bump();
-                let data_type = self.parse_data_type();
-                let name = self.parse_identifier();
-                let resolver = if self.eat(TokenKind::KwWith).is_some() {
-                    Some(self.parse_identifier())
-                } else {
-                    None
-                };
-                self.expect(TokenKind::Semicolon);
                 Some(ModuleItem::NettypeDeclaration(Box::new(
-                    NettypeDeclaration {
-                        data_type,
-                        name,
-                        resolver,
-                        span: self.span_from(start),
-                    },
+                    self.parse_nettype_declaration(),
                 )))
             }
             TokenKind::KwFor => {
@@ -1565,6 +1562,28 @@ impl<'a> Parser<'a> {
                 }))
             }
             _ => None,
+        }
+    }
+
+    /// §6.6.7 Syntax 6-1: `nettype data_type name [ with [scope::]tf_identifier ] ;`
+    pub(super) fn parse_nettype_declaration(&mut self) -> NettypeDeclaration {
+        let start = self.current_span().start;
+        self.bump(); // nettype
+        let data_type = self.parse_data_type();
+        let name = self.parse_identifier();
+        let (resolver_scopes, resolver) = if self.eat(TokenKind::KwWith).is_some() {
+            let tn = self.parse_type_name();
+            (tn.scopes, Some(tn.name))
+        } else {
+            (Vec::new(), None)
+        };
+        self.expect(TokenKind::Semicolon);
+        NettypeDeclaration {
+            data_type,
+            name,
+            resolver_scopes,
+            resolver,
+            span: self.span_from(start),
         }
     }
 }

@@ -14,7 +14,7 @@ pub(super) fn is_string_data_type(dt: &DataType) -> bool {
 /// string has no declared width, and fitting the value to the 1024-bit
 /// placeholder made `%s` print it behind 125 leading spaces.
 pub(super) fn string_param_value(init: &Expression, params: &HashMap<String, Value>) -> Value {
-    Value::from_string(&eval_const_expr_val(init, params).to_sv_string())
+    eval_const_expr_val(init, params).sv_string_strip_nul()
 }
 
 /// Detect whether struct/union type `target` (body `dt`) transitively contains
