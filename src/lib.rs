@@ -319,7 +319,9 @@ pub use value::Value;
 /// \x75 retains bounded class queue declarations (§7.10, §8.25).
 /// \x76 retains a design definition's default net type (§22.8).
 /// \x77 retains primitive drive strengths and distinguishes supply and unresolved nets.
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x77";
+/// \x78 records member signals for bounded unpacked structure-array input and output ports
+///         (§7.2.2, §7.4.2, §7.6, §23.2.2.3, §23.3.3.2–§23.3.3.3, §23.3.3.5).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x78";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
