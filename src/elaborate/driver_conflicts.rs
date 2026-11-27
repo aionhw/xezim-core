@@ -243,12 +243,20 @@ pub(super) fn validate_driver_conflicts(
         next += 1;
     }
     // §6.5 / §23.3.3: each output-port connection of an instance in this
-    // module is a continuous driver of its actual.
+    // module is a continuous driver of its actual. §27.4/§27.5: so is each
+    // one an instance makes in every iteration or branch that a generate
+    // construct elaborates.
     if let Some(defs) = all_defs {
-        for item in module.items() {
-            let ModuleItem::ModuleInstantiation(mi) = item else {
-                continue;
-            };
+        let mut generated = Vec::new();
+        if module.items().iter().any(is_generate_item) {
+            let mut params = elab.parameters.clone();
+            generated_instantiations(module.items(), &mut params, &mut generated);
+        }
+        let top = module.items().iter().filter_map(|it| match it {
+            ModuleItem::ModuleInstantiation(mi) => Some(mi),
+            _ => None,
+        });
+        for mi in top.chain(generated.iter()) {
             let Some(sub) = defs.get(&mi.module_name.name) else {
                 continue;
             };
@@ -405,6 +413,115 @@ pub(super) fn validate_driver_conflicts(
         }
     }
     Ok(())
+}
+
+fn is_generate_item(item: &ModuleItem) -> bool {
+    matches!(
+        item,
+        ModuleItem::GenerateRegion(_)
+            | ModuleItem::GenerateIf(_)
+            | ModuleItem::GenerateCase(_)
+            | ModuleItem::GenerateFor(_)
+    )
+}
+
+/// The module instantiations the generate constructs among `items` elaborate,
+/// one per loop iteration and taken branch, each with its genvar substituted
+/// and its block's declarations renamed as `elaborate_generate_for`,
+/// `elaborate_generate_if` and `elaborate_generate_case` do, so `.o(x[g])`
+/// names a different bit in each iteration and a block-local actual keeps its
+/// scope. A construct whose condition does not fold to a constant here
+/// contributes nothing: it can only miss a conflict, never invent one.
+fn generated_instantiations(
+    items: &[ModuleItem],
+    params: &mut HashMap<String, Value>,
+    out: &mut Vec<ModuleInstantiation>,
+) {
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(gr) => generated_body(&gr.items, params, out),
+            ModuleItem::GenerateIf(gi) => {
+                for (bi, (cond, branch)) in gi.branches.iter().enumerate() {
+                    let taken = match cond {
+                        Some(c) if is_const_expr(c, &*params) => eval_const_expr(c, params) != 0,
+                        Some(_) => break,
+                        None => true,
+                    };
+                    if taken {
+                        if gi.branch_direct.get(bi) == Some(&true) {
+                            generated_body(branch, params, out);
+                        } else {
+                            let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
+                            let scope = gen_scope_name(label, &gi.implicit_name);
+                            generated_body(&rename_decls_in_iter(branch, &scope), params, out);
+                        }
+                        break;
+                    }
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                if !is_const_expr(&gc.selector, &*params) {
+                    continue;
+                }
+                let sel = eval_const_expr(&gc.selector, params);
+                let hit = gc.arms.iter().find(|a| {
+                    a.values
+                        .iter()
+                        .any(|v| is_const_expr(v, &*params) && eval_const_expr(v, params) == sel)
+                });
+                let Some(arm) = hit.or_else(|| gc.arms.iter().find(|a| a.values.is_empty())) else {
+                    continue;
+                };
+                if arm.direct {
+                    generated_body(&arm.items, params, out);
+                } else {
+                    let scope = gen_scope_name(arm.label.as_ref(), &gc.implicit_name);
+                    generated_body(&rename_decls_in_iter(&arm.items, &scope), params, out);
+                }
+            }
+            ModuleItem::GenerateFor(gf) => {
+                let var = gf.var.clone();
+                let saved = params.get(&var).cloned();
+                let mut i = generate_for_start(gf, params);
+                for _ in 0..10000 {
+                    let mut gv = Value::from_u64(i as u64 as u32 as u64, 32);
+                    gv.is_signed = true;
+                    params.insert(var.clone(), gv);
+                    if eval_const_expr(&gf.cond, params) == 0 {
+                        break;
+                    }
+                    let subst = substitute_genvar_in_items(&gf.items, &var, i);
+                    let scope = format!(
+                        "{}[{}]",
+                        gen_scope_name(gf.name.as_ref(), &gf.implicit_name),
+                        i
+                    );
+                    generated_body(&rename_decls_in_iter(&subst, &scope), params, out);
+                    i = generate_for_next(gf, i, params);
+                }
+                match saved {
+                    Some(v) => params.insert(var, v),
+                    None => params.remove(&var),
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The body of a generate block: its instantiations, and those of the
+/// generate constructs nested in it.
+fn generated_body(
+    items: &[ModuleItem],
+    params: &mut HashMap<String, Value>,
+    out: &mut Vec<ModuleInstantiation>,
+) {
+    for item in items {
+        if let ModuleItem::ModuleInstantiation(mi) = item {
+            out.push(mi.clone());
+        }
+    }
+    generated_instantiations(items, params, out);
 }
 
 /// The actual expressions an instance connects to the OUTPUT ports of `sub`:
