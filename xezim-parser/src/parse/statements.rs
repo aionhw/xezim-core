@@ -2045,12 +2045,14 @@ impl<'a> Parser<'a> {
     /// §16.4: the pass and fail statements of a deferred immediate assertion
     /// (`assert #0`, `assert final`) are each a single subroutine call: a
     /// task, task method, void function or system task call, or a function
-    /// call cast to `void`. A simple immediate assertion takes any statement.
+    /// call cast to `void`. A null statement omits the action. A simple
+    /// immediate assertion takes any statement.
     fn check_deferred_action(&mut self, deferred: Option<DeferredAssertion>, s: &Statement) {
         if deferred.is_none() || !crate::strict_checks() {
             return;
         }
-        let is_call = match &s.kind {
+        let valid_action = match &s.kind {
+            StatementKind::Null => true,
             StatementKind::Expr(e) => {
                 let mut e = e;
                 while let ExprKind::Paren(p) = &e.kind {
@@ -2066,7 +2068,7 @@ impl<'a> Parser<'a> {
             }
             _ => false,
         };
-        if !is_call {
+        if !valid_action {
             self.diagnostics.push(crate::diagnostics::Diagnostic::error(
                 "the pass and fail statements of a deferred assertion must each be a single \
                  subroutine call (IEEE 1800-2017 §16.4)",
