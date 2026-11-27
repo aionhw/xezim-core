@@ -529,6 +529,10 @@ impl<'a> Binder<'a> {
     /// the hierarchy (§23.8.1). `bare`: the name is the whole reference, not
     /// the head of a path (`a.b`).
     fn resolve(&self, name: &str, bare: bool) -> Outcome {
+        self.resolve_at(name, bare, None)
+    }
+
+    fn resolve_at(&self, name: &str, bare: bool, site: Option<Span>) -> Outcome {
         // A.2.2.3: the delay value `1step` is carried as a name.
         if name.is_empty()
             || name.contains("::")
@@ -554,7 +558,19 @@ impl<'a> Binder<'a> {
             while let Some(s) = at {
                 let scope = &tree.scopes[s.0 as usize];
                 if let Some(d) = scope.by_name.get(name) {
-                    match tree.decls[d.0 as usize].kind {
+                    let decl = &tree.decls[d.0 as usize];
+                    // §26.3: a value declared later in a generate block
+                    // cannot shadow an outer name used by a delay operand.
+                    let declared_later = site.is_some_and(|site| {
+                        matches!(scope.kind, ScopeKind::Generate { .. })
+                            && matches!(
+                                decl.kind,
+                                DeclKind::Data | DeclKind::Net | DeclKind::Param | DeclKind::EnumMember
+                            )
+                            && decl.span.start > site.start
+                    });
+                    match decl.kind {
+                        _ if declared_later => {}
                         DeclKind::ImplicitNet if depth == 0 => implicit = Some(*d),
                         _ if depth == 0 => return Outcome::Decl(*d),
                         // §23.8.1: a call finds the subroutine upward.
@@ -655,7 +671,8 @@ impl<'a> Binder<'a> {
         let outcome = if h.root.is_some() || h.bound == Bound::NO_TARGET {
             Outcome::None(Hide::Qualified)
         } else {
-            self.resolve(&first.name.name, h.path.len() == 1)
+            let site = (self.pos == "assign-delay" && !self.callee).then_some(first.name.span);
+            self.resolve_at(&first.name.name, h.path.len() == 1, site)
         };
         let bound = match outcome {
             Outcome::Decl(d) => {

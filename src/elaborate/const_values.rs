@@ -784,7 +784,7 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                 // §6.24.1: an integral target is the operand's context width.
                 let integral = matches!(
                     dt.as_ref(),
-                    DataType::IntegerAtom { .. } | DataType::IntegerVector { .. }
+                    DataType::IntegerAtom { .. } | DataType::IntegerVector { .. } | DataType::Enum(_)
                 );
                 let v = if integral {
                     eval_const_expr_val_with_ctx(&args[1], params, Some(w), types)

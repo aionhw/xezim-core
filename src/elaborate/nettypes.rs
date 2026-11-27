@@ -757,24 +757,42 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
         scope_indexed_net_name(e, &prefix, elab)
     };
 
-    // A sub-module body may still sit in the LAZY pending list, where two
-    // instances driving one parent net are invisible. Materialize exactly the
-    // entries landing on a nettype net — the treatment
-    // `resolve_multi_driver_nets` gives its own folds.
+    // A sub-module body may still sit in the LAZY pending list. Bring its
+    // drivers into the same fold the eagerly elaborated drivers use.
     {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for pca in pending {
             let lhs = pca.materialize_lhs();
-            // A member of one too (`u.p.V`): a port connection taken apart.
-            // §6.6.8: an element select of a nettype ARRAY (`a[0]`) names that
-            // element's resolvable net too.
-            if driver_net(elab, &lhs, &pca.ctx.prefix).is_some_and(|n| {
-                net_resolver.contains_key(&n)
+            let net = driver_net(elab, &lhs, &pca.ctx.prefix);
+            if net.as_deref().is_some_and(|n| {
+                net_resolver.contains_key(n)
                     || n.match_indices('.')
                         .any(|(i, _)| net_resolver.contains_key(&n[..i]))
             }) {
                 let ca = pca.materialize(&elab.parameters);
-                elab.continuous_assigns.push(ca);
+                // §6.6.7, §7.6: undelayed whole-array drivers contribute one
+                // value per element. The resolver keys and port merges are
+                // already per element. Delayed array drivers need separate
+                // staging for each element and retain their existing path.
+                let is_resolved_array = net.as_deref().is_some_and(|n| {
+                    elab.arrays.contains_key(n)
+                        && net_resolver.get(n).is_some_and(|r| !r.is_empty())
+                });
+                if is_resolved_array
+                    && ca.delay() == 0
+                    && ca.delay_exprs().is_none()
+                    && ca.delay_fall().is_none()
+                    && ca.delay_off().is_none()
+                    && let Some(parts) = expanded_array_assign_parts(&ca, elab)
+                    && parts.iter().all(|part| {
+                        driver_net(elab, &part.lhs_expr(), ca.origin().map_or("", |(_, scope)| scope.as_ref()))
+                            .is_some_and(|n| net_resolver.contains_key(&n))
+                    })
+                {
+                    elab.continuous_assigns.extend(parts);
+                } else {
+                    elab.continuous_assigns.push(ca);
+                }
             } else {
                 elab.pending_cont_assign.push(pca);
             }
