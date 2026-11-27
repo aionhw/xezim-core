@@ -36,11 +36,15 @@ pub(super) fn generate_for_next(gf: &GenerateFor, i: i64, params: &HashMap<Strin
 /// `eval_const_expr` reads one as 0, so fold the calls to literals first —
 /// the same substitution parameter initializers use. None leaves the
 /// expression as written (and its prior error).
-fn fold_const_fn_in_generate(expr: &Expression, elab: &ElaboratedModule) -> Option<Expression> {
+pub(super) fn fold_const_fn_in_generate(
+    expr: &Expression,
+    elab: &ElaboratedModule,
+    params: &HashMap<String, Value>,
+) -> Option<Expression> {
     if !expr_has_call(expr) {
         return None;
     }
-    substitute_const_fn_calls(expr,Some(&elab.parameters), elab, 0).filter(|f| !expr_has_call(f))
+    substitute_const_fn_calls(expr, Some(params), elab, 0).filter(|f| !expr_has_call(f))
 }
 
 /// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
@@ -66,7 +70,7 @@ pub(super) fn elaborate_generate_if(
     for (bi, (cond, items)) in gi.branches.iter().enumerate() {
         match cond {
             Some(c) => {
-                let folded = fold_const_fn_in_generate(c, elab);
+                let folded = fold_const_fn_in_generate(c, elab, &elab.parameters);
                 let c = folded.as_ref().unwrap_or(c);
                 if !is_const_expr(c, &elab.parameters) {
                     return Err("Generate if condition must be a constant expression".to_string());
@@ -90,7 +94,7 @@ pub(super) fn elaborate_generate_case(
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
 ) -> Result<(), String> {
-    let sel_folded = fold_const_fn_in_generate(&gc.selector, elab);
+    let sel_folded = fold_const_fn_in_generate(&gc.selector, elab, &elab.parameters);
     let selector = sel_folded.as_ref().unwrap_or(&gc.selector);
     if !is_const_expr(selector, &elab.parameters) {
         return Err("Generate case selector must be a constant expression".to_string());
@@ -102,7 +106,7 @@ pub(super) fn elaborate_generate_case(
             continue;
         } // skip default in this pass
         for v in &arm.values {
-            let v_folded = fold_const_fn_in_generate(v, elab);
+            let v_folded = fold_const_fn_in_generate(v, elab, &elab.parameters);
             let v = v_folded.as_ref().unwrap_or(v);
             if !is_const_expr(v, &elab.parameters) {
                 return Err("Generate case value must be a constant expression".to_string());

@@ -247,31 +247,17 @@ pub(super) fn validate_driver_conflicts(
     // one an instance makes in every iteration or branch that a generate
     // construct elaborates.
     if let Some(defs) = all_defs {
-        let mut generated = Vec::new();
-        if module.items().iter().any(is_generate_item) {
-            let mut params = elab.parameters.clone();
-            generated_instantiations(module.items(), &mut params, &mut generated);
-        }
-        let top = module.items().iter().filter_map(|it| match it {
-            ModuleItem::ModuleInstantiation(mi) => Some(mi),
-            _ => None,
-        });
-        for mi in top.chain(generated.iter()) {
+        let mut add_ports = |mi: &ModuleInstantiation| {
             let Some(sub) = defs.get(&mi.module_name.name) else {
-                continue;
+                return;
             };
             if !matches!(sub, Definition::Module(_) | Definition::Program(_)) {
-                continue;
+                return;
             }
             for hi in &mi.instances {
                 for actual in output_port_actuals(sub, &hi.connections) {
                     let mut spans = Vec::new();
                     lvalue_write_spans(&actual, elab, &mut spans);
-                    if let ExprKind::Concatenation(parts) = &actual.kind {
-                        for part in parts {
-                            lvalue_write_spans(part, elab, &mut spans);
-                        }
-                    }
                     for (n, sp) in spans {
                         if is_var(&n) {
                             writers
@@ -283,6 +269,15 @@ pub(super) fn validate_driver_conflicts(
                     next += 1;
                 }
             }
+        };
+        for item in module.items() {
+            if let ModuleItem::ModuleInstantiation(mi) = item {
+                add_ports(mi);
+            }
+        }
+        if module.items().iter().any(is_generate_item) {
+            let mut params = elab.parameters.clone();
+            generated_instantiations(module.items(), elab, &mut params, &mut add_ports);
         }
     }
     for item in module.items() {
@@ -434,49 +429,77 @@ fn is_generate_item(item: &ModuleItem) -> bool {
 /// contributes nothing: it can only miss a conflict, never invent one.
 fn generated_instantiations(
     items: &[ModuleItem],
+    elab: &ElaboratedModule,
     params: &mut HashMap<String, Value>,
-    out: &mut Vec<ModuleInstantiation>,
+    visit: &mut impl FnMut(&ModuleInstantiation),
 ) {
-    for item in items {
+    'items: for item in items {
         match item {
-            ModuleItem::GenerateRegion(gr) => generated_body(&gr.items, params, out),
+            ModuleItem::GenerateRegion(gr) => generated_body(&gr.items, elab, params, visit),
             ModuleItem::GenerateIf(gi) => {
                 for (bi, (cond, branch)) in gi.branches.iter().enumerate() {
                     let taken = match cond {
-                        Some(c) if is_const_expr(c, &*params) => eval_const_expr(c, params) != 0,
-                        Some(_) => break,
+                        Some(c) => {
+                            let folded = fold_const_fn_in_generate(c, elab, params);
+                            let c = folded.as_ref().unwrap_or(c);
+                            if !is_const_expr(c, &*params) {
+                                break;
+                            }
+                            eval_const_expr(c, params) != 0
+                        }
                         None => true,
                     };
                     if taken {
                         if gi.branch_direct.get(bi) == Some(&true) {
-                            generated_body(branch, params, out);
+                            generated_body(branch, elab, params, visit);
                         } else {
                             let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
                             let scope = gen_scope_name(label, &gi.implicit_name);
-                            generated_body(&rename_decls_in_iter(branch, &scope), params, out);
+                            generated_body(
+                                &rename_decls_in_iter(branch, &scope),
+                                elab,
+                                params,
+                                visit,
+                            );
                         }
                         break;
                     }
                 }
             }
             ModuleItem::GenerateCase(gc) => {
-                if !is_const_expr(&gc.selector, &*params) {
+                let folded = fold_const_fn_in_generate(&gc.selector, elab, params);
+                let selector = folded.as_ref().unwrap_or(&gc.selector);
+                if !is_const_expr(selector, &*params) {
                     continue;
                 }
-                let sel = eval_const_expr(&gc.selector, params);
-                let hit = gc.arms.iter().find(|a| {
-                    a.values
-                        .iter()
-                        .any(|v| is_const_expr(v, &*params) && eval_const_expr(v, params) == sel)
-                });
+                let sel = eval_const_expr(selector, params);
+                let mut hit = None;
+                'arms: for arm in &gc.arms {
+                    for value in &arm.values {
+                        let folded = fold_const_fn_in_generate(value, elab, params);
+                        let value = folded.as_ref().unwrap_or(value);
+                        if !is_const_expr(value, &*params) {
+                            continue 'items;
+                        }
+                        if eval_const_expr(value, params) == sel {
+                            hit = Some(arm);
+                            break 'arms;
+                        }
+                    }
+                }
                 let Some(arm) = hit.or_else(|| gc.arms.iter().find(|a| a.values.is_empty())) else {
                     continue;
                 };
                 if arm.direct {
-                    generated_body(&arm.items, params, out);
+                    generated_body(&arm.items, elab, params, visit);
                 } else {
                     let scope = gen_scope_name(arm.label.as_ref(), &gc.implicit_name);
-                    generated_body(&rename_decls_in_iter(&arm.items, &scope), params, out);
+                    generated_body(
+                        &rename_decls_in_iter(&arm.items, &scope),
+                        elab,
+                        params,
+                        visit,
+                    );
                 }
             }
             ModuleItem::GenerateFor(gf) => {
@@ -496,7 +519,7 @@ fn generated_instantiations(
                         gen_scope_name(gf.name.as_ref(), &gf.implicit_name),
                         i
                     );
-                    generated_body(&rename_decls_in_iter(&subst, &scope), params, out);
+                    generated_body(&rename_decls_in_iter(&subst, &scope), elab, params, visit);
                     i = generate_for_next(gf, i, params);
                 }
                 match saved {
@@ -513,15 +536,16 @@ fn generated_instantiations(
 /// generate constructs nested in it.
 fn generated_body(
     items: &[ModuleItem],
+    elab: &ElaboratedModule,
     params: &mut HashMap<String, Value>,
-    out: &mut Vec<ModuleInstantiation>,
+    visit: &mut impl FnMut(&ModuleInstantiation),
 ) {
     for item in items {
         if let ModuleItem::ModuleInstantiation(mi) = item {
-            out.push(mi.clone());
+            visit(mi);
         }
     }
-    generated_instantiations(items, params, out);
+    generated_instantiations(items, elab, params, visit);
 }
 
 /// The actual expressions an instance connects to the OUTPUT ports of `sub`:
