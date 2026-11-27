@@ -69,14 +69,17 @@ impl<'a> Parser<'a> {
                     // Bare interface ports have no direction and may name a
                     // type resolved later by elaboration.
                     if kind.is_none() && port.direction.is_some() {
-                        self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                        self.diagnostics.push(crate::diagnostics::Diagnostic::warning(
                             format!(
-                                "port '{}' requires an explicit net or variable kind under `default_nettype none (IEEE 1800-2023 §23.2.2.3)",
+                                "port '{}' omits an explicit net or variable kind under `default_nettype none; defaulting to wire (IEEE 1800-2023 §23.2.2.3)",
                                 port.name.name,
                             ),
                             port.span,
                         ));
                     }
+                    // Under `default_nettype none`, `kind` is `None`, leaving
+                    // `port.net_type` as `None` — identical to `default_nettype
+                    // wire`, which elaboration resolves to `wire`.
                     port.net_type = kind.filter(|nt| *nt != NetType::Wire);
                 }
                 // §23.2.2.4: only an input port takes a default value; an
