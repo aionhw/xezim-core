@@ -810,10 +810,46 @@ impl<'a> Parser<'a> {
         if !self.at(TokenKind::Identifier) {
             return false;
         }
-        matches!(
-            self.peek_kind(),
-            TokenKind::RBracket | TokenKind::DoubleColon | TokenKind::Hash
-        )
+        match self.peek_kind() {
+            TokenKind::RBracket | TokenKind::DoubleColon | TokenKind::Hash => true,
+            TokenKind::LBracket => self.has_packed_dims_then_rbracket(),
+            _ => false,
+        }
+    }
+
+    /// Distinguish `aa[typedef_id [MSB:LSB]]` (associative key with packed dims)
+    /// from an array/constant index expression like `aa[arr[0]]`.
+    fn has_packed_dims_then_rbracket(&self) -> bool {
+        let mut i = self.pos + 1;
+        let mut saw_dim = false;
+        while self.tokens.get(i).map(|t| t.kind) == Some(TokenKind::LBracket) {
+            i += 1;
+            let mut depth = 1usize;
+            let mut has_colon = false;
+            while let Some(tok) = self.tokens.get(i) {
+                match tok.kind {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    TokenKind::Colon if depth == 1 => has_colon = true,
+                    TokenKind::Eof => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth != 0 || !has_colon {
+                return false;
+            }
+            saw_dim = true;
+        }
+        saw_dim
+            && self.tokens.get(i).map(|t| t.kind) == Some(TokenKind::RBracket)
     }
     fn parse_enum_type(&mut self) -> DataType {
         let start = self.current_span().start;

@@ -2178,6 +2178,7 @@ pub fn elaborate_module_with_defs(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
+                        register_assoc_key_kind_meta(&mut elab, &decl.name.name, key_dt.as_deref());
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -2371,16 +2372,17 @@ pub fn elaborate_module_with_defs(
                                             .entry(name.clone())
                                             .or_insert_with(|| f.clone());
                                     }
-                                    let assoc_key_info = match qd {
-                                        UnpackedDimension::Associative { data_type, .. } => {
+                                    let (assoc_kdt, assoc_key_info) = match qd {
+                                        UnpackedDimension::Associative { data_type, .. } => (
+                                            data_type.as_deref(),
                                             assoc_key_type_info(
                                                 data_type.as_deref(),
                                                 &elab.parameters,
                                                 &elab.typedefs,
                                                 &elab.typedef_types,
-                                            )
-                                        }
-                                        _ => (None, None),
+                                            ),
+                                        ),
+                                        _ => (None, (None, None)),
                                     };
                                     let is_queue = matches!(qd, UnpackedDimension::Queue { .. });
                                     let tail = &effective_dims[split + 1..];
@@ -2430,6 +2432,7 @@ pub fn elaborate_module_with_defs(
                                             register_assoc_element_key_type(
                                                 &mut elab,
                                                 en,
+                                                assoc_kdt,
                                                 is_str,
                                                 width,
                                                 &assoc_key_info,
@@ -2448,15 +2451,15 @@ pub fn elaborate_module_with_defs(
                                         }
                                         if let Some(inner) = &tail_shape {
                                             if let Some(td) = &tail_decl {
-                                                let mut all = vec![(0i64, 63i64)];
+                                                let mut all = vec![(0i64, -1i64)];
                                                 all.extend(td.iter().copied());
                                                 elab.unpacked_decl_dims.insert(en.clone(), all);
                                             }
                                             if inner.len() == 1 {
                                                 elab.arrays_2d
-                                                    .insert(en.clone(), ((0, 63), inner[0], width));
+                                                    .insert(en.clone(), ((0, -1), inner[0], width));
                                             } else {
-                                                let mut full = vec![(0i64, 63i64)];
+                                                let mut full = vec![(0i64, -1i64)];
                                                 full.extend(inner.iter().copied());
                                                 elab.arrays_nd.insert(en.clone(), (full, width));
                                             }
@@ -2471,7 +2474,7 @@ pub fn elaborate_module_with_defs(
                                         } else {
                                             elab.var_decl_types
                                                 .insert(en.clone(), dd.data_type.clone());
-                                            elab.arrays.insert(en, (0, 63, width));
+                                            elab.arrays.insert(en, (0, -1, width));
                                         }
                                     }
                                     elab.var_decl_types.insert(name, dd.data_type.clone());
@@ -2692,15 +2695,15 @@ pub fn elaborate_module_with_defs(
                             if let Some(dd) =
                                 declared_unpacked_dims(&effective_dims[1..], &elab.parameters)
                             {
-                                let mut all = vec![(0i64, 63i64)];
+                                let mut all = vec![(0i64, -1i64)];
                                 all.extend(dd);
                                 elab.unpacked_decl_dims.insert(name.clone(), all);
                             }
                             if inner.len() == 1 {
                                 elab.arrays_2d
-                                    .insert(name.clone(), ((0, 63), inner[0], width));
+                                    .insert(name.clone(), ((0, -1), inner[0], width));
                             } else {
-                                let mut shape = vec![(0i64, 63i64)];
+                                let mut shape = vec![(0i64, -1i64)];
                                 shape.extend(inner.iter().cloned());
                                 elab.arrays_nd.insert(name.clone(), (shape, width));
                             }
@@ -3535,7 +3538,24 @@ pub fn elaborate_module_with_defs(
                                                         }
                                                     )
                                                 });
-                                                elab.associative_arrays.insert(key, is_str);
+                                                elab.associative_arrays.insert(key.clone(), is_str);
+                                                register_assoc_key_kind_meta(
+                                                    &mut elab,
+                                                    &key,
+                                                    kdt.as_deref(),
+                                                );
+                                                let (kiw, ktn) = assoc_key_type_info(
+                                                    kdt.as_deref(),
+                                                    &elab.parameters,
+                                                    &elab.typedefs,
+                                                    &elab.typedef_types,
+                                                );
+                                                if let Some(iw) = kiw {
+                                                    elab.assoc_index_widths.insert(key.clone(), iw);
+                                                }
+                                                if let Some(tn) = ktn {
+                                                    elab.assoc_key_type_names.insert(key, tn);
+                                                }
                                             }
                                             _ => {
                                                 elab.dynamic_arrays.insert(key.clone());
@@ -3560,7 +3580,7 @@ pub fn elaborate_module_with_defs(
                                                             .insert(key.clone(), (n + 1) as u32);
                                                     }
                                                 }
-                                                elab.arrays.insert(key, (0, 63, mw));
+                                                elab.arrays.insert(key, (0, -1, mw));
                                             }
                                         }
                                     }

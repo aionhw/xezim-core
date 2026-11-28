@@ -1276,8 +1276,8 @@ pub fn extract_array_range(
         }
         crate::ast::types::UnpackedDimension::Unsized(_)
         | crate::ast::types::UnpackedDimension::Queue { .. } => {
-            // For dynamic arrays and queues, allocate a fixed-size buffer for simulation
-            Some((0, 63))
+            // Dynamic arrays and queues start empty (no pre-allocated slots).
+            Some((0, -1))
         }
         crate::ast::types::UnpackedDimension::Associative {
             data_type: Some(dt),
@@ -1340,9 +1340,7 @@ pub(super) fn width_with_unpacked_dims(
             }
             crate::ast::types::UnpackedDimension::Unsized(_)
             | crate::ast::types::UnpackedDimension::Queue { .. }
-            | crate::ast::types::UnpackedDimension::Associative { .. } => {
-                total_elements *= 64;
-            }
+            | crate::ast::types::UnpackedDimension::Associative { .. } => {}
         }
     }
     base_width * total_elements

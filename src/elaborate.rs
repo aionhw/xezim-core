@@ -2582,8 +2582,19 @@ pub struct ElaboratedClass {
     /// `handle#member` dispatch), so statics keep their own map. Consulted by
     /// `assoc_index_width_for` for a per-spec `Class#spec::member` key so
     /// `foreach` binds a SIGNED index with its true width.
+    /// static members (`static_assoc_key_types`), kept out of per-instance maps.
     #[serde(default)]
     pub static_assoc_index_props: HashMap<String, (u32, bool)>,
+    /// Wildcard `[*]` associative properties (`m[*]`), per-instance and static.
+    #[serde(default)]
+    pub wildcard_assoc_props: HashSet<String>,
+    #[serde(default)]
+    pub static_wildcard_assoc_props: HashSet<String>,
+    /// Unpacked-struct key types for associative properties (§7.8.5).
+    #[serde(default)]
+    pub assoc_key_struct_props: HashMap<String, DataType>,
+    #[serde(default)]
+    pub static_assoc_key_struct_props: HashMap<String, DataType>,
     /// §8.25: the KEY type of an instance assoc member whose packed range
     /// depends on a class parameter (`logic [7:0] m[a_t]` with
     /// `typedef logic [AW-1:0] a_t;`). `assoc_index_props` holds the width at
@@ -2877,6 +2888,12 @@ pub struct ElaboratedModule {
     /// arrays are excluded (handled by the `bool` flag above).
     #[serde(default)]
     pub assoc_index_widths: HashMap<String, (u32, bool)>,
+    /// Wildcard `[*]` associative arrays (§7.8.1).
+    #[serde(default)]
+    pub wildcard_assoc_arrays: HashSet<String>,
+    /// Unpacked-struct key types for associative arrays (§7.8.5).
+    #[serde(default)]
+    pub assoc_key_struct_types: HashMap<String, DataType>,
     /// Class definitions: name -> elaborated class.
     pub classes: HashMap<String, std::sync::Arc<ElaboratedClass>>,
     /// Covergroup definitions: name -> AST declaration.
@@ -3642,6 +3659,8 @@ impl ElaboratedModule {
             associative_arrays: HashMap::default(),
             assoc_elem_widths: HashMap::default(),
             assoc_index_widths: HashMap::default(),
+            wildcard_assoc_arrays: HashSet::default(),
+            assoc_key_struct_types: HashMap::default(),
             classes: HashMap::default(),
             covergroups: HashMap::default(),
             functions: FuncTable::default(),

@@ -360,6 +360,7 @@ pub(super) fn elaborate_items(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
+                        register_assoc_key_kind_meta(elab, &decl.name.name, key_dt.as_deref());
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -480,16 +481,17 @@ pub(super) fn elaborate_items(
                                             .entry(name.clone())
                                             .or_insert_with(|| f.clone());
                                     }
-                                    let assoc_key_info = match qd {
-                                        UnpackedDimension::Associative { data_type, .. } => {
+                                    let (assoc_kdt, assoc_key_info) = match qd {
+                                        UnpackedDimension::Associative { data_type, .. } => (
+                                            data_type.as_deref(),
                                             assoc_key_type_info(
                                                 data_type.as_deref(),
                                                 &elab.parameters,
                                                 &elab.typedefs,
                                                 &elab.typedef_types,
-                                            )
-                                        }
-                                        _ => (None, None),
+                                            ),
+                                        ),
+                                        _ => (None, (None, None)),
                                     };
                                     let is_queue = matches!(qd, UnpackedDimension::Queue { .. });
                                     let tail = &eff_dims[split + 1..];
@@ -539,6 +541,7 @@ pub(super) fn elaborate_items(
                                             register_assoc_element_key_type(
                                                 elab,
                                                 en,
+                                                assoc_kdt,
                                                 is_str,
                                                 width,
                                                 &assoc_key_info,
@@ -557,15 +560,15 @@ pub(super) fn elaborate_items(
                                         }
                                         if let Some(inner) = &tail_shape {
                                             if let Some(td) = &tail_decl {
-                                                let mut all = vec![(0i64, 63i64)];
+                                                let mut all = vec![(0i64, -1i64)];
                                                 all.extend(td.iter().copied());
                                                 elab.unpacked_decl_dims.insert(en.clone(), all);
                                             }
                                             if inner.len() == 1 {
                                                 elab.arrays_2d
-                                                    .insert(en.clone(), ((0, 63), inner[0], width));
+                                                    .insert(en.clone(), ((0, -1), inner[0], width));
                                             } else {
-                                                let mut full = vec![(0i64, 63i64)];
+                                                let mut full = vec![(0i64, -1i64)];
                                                 full.extend(inner.iter().copied());
                                                 elab.arrays_nd.insert(en.clone(), (full, width));
                                             }
@@ -580,7 +583,7 @@ pub(super) fn elaborate_items(
                                                     .insert(en, tn.name.name.clone());
                                             }
                                         } else {
-                                            elab.arrays.insert(en, (0, 63, width));
+                                            elab.arrays.insert(en, (0, -1, width));
                                         }
                                     }
                                     elab.var_decl_types

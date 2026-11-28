@@ -4644,7 +4644,7 @@ pub(super) fn inline_instantiation_items(
                                                     &effective_decl_dims[1..],
                                                     &sub_merged_params,
                                                 ) {
-                                                    let mut all = vec![(0i64, 63i64)];
+                                                    let mut all = vec![(0i64, -1i64)];
                                                     all.extend(dd_inner);
                                                     elab.unpacked_decl_dims
                                                         .insert(sig_name.clone(), all);
@@ -4652,10 +4652,10 @@ pub(super) fn inline_instantiation_items(
                                                 if inner.len() == 1 {
                                                     elab.arrays_2d.insert(
                                                         sig_name.clone(),
-                                                        ((0, 63), inner[0], width),
+                                                        ((0, -1), inner[0], width),
                                                     );
                                                 } else {
-                                                    let mut shape = vec![(0i64, 63i64)];
+                                                    let mut shape = vec![(0i64, -1i64)];
                                                     shape.extend(inner.iter().copied());
                                                     elab.arrays_nd
                                                         .insert(sig_name.clone(), (shape, width));
@@ -4683,6 +4683,11 @@ pub(super) fn inline_instantiation_items(
                                             )
                                         });
                                         elab.associative_arrays.insert(sig_name.clone(), is_str);
+                                        register_assoc_key_kind_meta(
+                                            elab,
+                                            &sig_name,
+                                            kdt.as_deref(),
+                                        );
                                         // §10.7: the element width, under the SCOPED name — the runtime
                                         // looks it up by resolved signal name, and a bare leaf would
                                         // collide with a same-named array in another module.
@@ -4796,17 +4801,20 @@ pub(super) fn inline_instantiation_items(
                                                     })),
                                                     _ => None,
                                                 };
-                                                let assoc_key_info = match qd {
+                                                let (assoc_kdt, assoc_key_info) = match qd {
                                                     UnpackedDimension::Associative {
                                                         data_type,
                                                         ..
-                                                    } => assoc_key_type_info(
+                                                    } => (
                                                         data_type.as_deref(),
-                                                        &sub_merged_params,
-                                                        &elab.typedefs,
-                                                        &elab.typedef_types,
+                                                        assoc_key_type_info(
+                                                            data_type.as_deref(),
+                                                            &sub_merged_params,
+                                                            &elab.typedefs,
+                                                            &elab.typedef_types,
+                                                        ),
                                                     ),
-                                                    _ => (None, None),
+                                                    _ => (None, (None, None)),
                                                 };
                                                 let is_queue = matches!(
                                                     qd,
@@ -4871,6 +4879,7 @@ pub(super) fn inline_instantiation_items(
                                                         register_assoc_element_key_type(
                                                             elab,
                                                             en,
+                                                            assoc_kdt,
                                                             is_str,
                                                             width,
                                                             &assoc_key_info,
@@ -4889,7 +4898,7 @@ pub(super) fn inline_instantiation_items(
                                                     }
                                                     if let Some(inner) = &tail_shape {
                                                         if let Some(td) = &tail_decl {
-                                                            let mut all = vec![(0i64, 63i64)];
+                                                            let mut all = vec![(0i64, -1i64)];
                                                             all.extend(td.iter().copied());
                                                             elab.unpacked_decl_dims
                                                                 .insert(en.clone(), all);
@@ -4897,10 +4906,10 @@ pub(super) fn inline_instantiation_items(
                                                         if inner.len() == 1 {
                                                             elab.arrays_2d.insert(
                                                                 en.clone(),
-                                                                ((0, 63), inner[0], width),
+                                                                ((0, -1), inner[0], width),
                                                             );
                                                         } else {
-                                                            let mut full = vec![(0i64, 63i64)];
+                                                            let mut full = vec![(0i64, -1i64)];
                                                             full.extend(inner.iter().copied());
                                                             elab.arrays_nd
                                                                 .insert(en.clone(), (full, width));
@@ -4922,7 +4931,7 @@ pub(super) fn inline_instantiation_items(
                                                             en.clone(),
                                                             std::rc::Rc::clone(&shared_dt),
                                                         );
-                                                        elab.arrays.insert(en, (0, 63, width));
+                                                        elab.arrays.insert(en, (0, -1, width));
                                                     }
                                                 }
                                                 elab.var_decl_types

@@ -1033,6 +1033,10 @@ fn elaborate_class_in_scope(
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut static_assoc_key_types: HashMap<String, String> = HashMap::default();
     let mut static_assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
+    let mut wildcard_assoc_props: HashSet<String> = HashSet::default();
+    let mut static_wildcard_assoc_props: HashSet<String> = HashSet::default();
+    let mut assoc_key_struct_props: HashMap<String, DataType> = HashMap::default();
+    let mut static_assoc_key_struct_props: HashMap<String, DataType> = HashMap::default();
     let mut static_fixed_arrays: Vec<(String, i64, i64, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
@@ -1274,20 +1278,30 @@ fn elaborate_class_in_scope(
                                             ..
                                         }
                                     ) {
-                                        // A typedef'd key (`k12_t`) resolves through the
-                                        // installed typedef table; without it the
-                                        // index width fell back to 32 bits.
                                         let kt = class_local_typedef_target(c, kdt, u8::MAX);
-                                        let kw = typedefs_snapshot(|td| {
-                                            resolve_type_width(kt, class_params, td)
+                                        let struct_kt = TYPEDEF_SHAPES_TLS.with(|td| {
+                                            resolve_unpacked_struct_key_type(
+                                                Some(kt),
+                                                &td.borrow().0,
+                                            )
                                         });
-                                        if kw > 0 {
-                                            static_assoc_index_props.insert(
-                                                decl.name.name.clone(),
-                                                (kw, is_type_signed(kdt)),
-                                            );
+                                        if let Some(st) = struct_kt {
+                                            static_assoc_key_struct_props
+                                                .insert(decl.name.name.clone(), st);
+                                        } else {
+                                            let kw = typedefs_snapshot(|td| {
+                                                resolve_type_width(kt, class_params, td)
+                                            });
+                                            if kw > 0 {
+                                                static_assoc_index_props.insert(
+                                                    decl.name.name.clone(),
+                                                    (kw, is_type_signed(kt)),
+                                                );
+                                            }
                                         }
                                     }
+                                } else {
+                                    static_wildcard_assoc_props.insert(decl.name.name.clone());
                                 }
                             }
                             Some(UnpackedDimension::Queue { .. })
@@ -1438,18 +1452,24 @@ fn elaborate_class_in_scope(
                             // so the runtime narrows a wider index expression.
                             if !is_string_key {
                                 if let Some(kdt) = key_dt.as_ref() {
-                                    // A typedef'd key (`k12_t`) resolves through the
-                                    // installed typedef table; without it the
-                                    // index width fell back to 32 bits.
                                     let kt = class_local_typedef_target(c, kdt, u8::MAX);
-                                    let kw = typedefs_snapshot(|td| {
-                                        resolve_type_width(kt, class_params, td)
+                                    let struct_kt = TYPEDEF_SHAPES_TLS.with(|td| {
+                                        resolve_unpacked_struct_key_type(Some(kt), &td.borrow().0)
                                     });
-                                    if kw > 0 {
-                                        assoc_index_props.insert(
-                                            decl.name.name.clone(),
-                                            (kw, is_type_signed(kdt)),
-                                        );
+                                    if let Some(st) = struct_kt {
+                                        assoc_key_struct_props
+                                            .insert(decl.name.name.clone(), st);
+                                    } else {
+                                        let kw = typedefs_snapshot(|td| {
+                                            resolve_type_width(kt, class_params, td)
+                                        });
+                                        if kw > 0 {
+                                            let signed = TYPEDEF_SHAPES_TLS.with(|td| {
+                                                is_type_signed_resolved(kt, &td.borrow().0)
+                                            });
+                                            assoc_index_props
+                                                .insert(decl.name.name.clone(), (kw, signed));
+                                        }
                                     }
                                     if let DataType::IntegerVector { dimensions, .. }
                                     | DataType::Implicit { dimensions, .. } = kt
@@ -1461,6 +1481,8 @@ fn elaborate_class_in_scope(
                                         assoc_key_decl_types
                                             .insert(decl.name.name.clone(), kt.clone());
                                     }
+                                } else {
+                                    wildcard_assoc_props.insert(decl.name.name.clone());
                                 }
                             }
                         }
@@ -2170,6 +2192,10 @@ fn elaborate_class_in_scope(
         static_collections,
         static_assoc_key_types,
         static_assoc_index_props,
+        wildcard_assoc_props,
+        static_wildcard_assoc_props,
+        assoc_key_struct_props,
+        static_assoc_key_struct_props,
         static_fixed_arrays,
         array_properties,
         param_sized_props,
