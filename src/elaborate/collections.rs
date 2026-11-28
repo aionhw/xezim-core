@@ -18,11 +18,27 @@ pub fn coll_elem_split(dims: &[UnpackedDimension]) -> Option<usize> {
     if dims.len() < 2 {
         return None;
     }
+    let is_fixed = |d: &UnpackedDimension| {
+        matches!(
+            d,
+            UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }
+        )
+    };
     if let Some(k) = dims
         .iter()
         .position(|d| matches!(d, UnpackedDimension::Associative { .. }))
         && k >= 1
         && k + 1 < dims.len()
+    {
+        return Some(k);
+    }
+    if let Some(k) = dims.iter().position(|d| {
+        matches!(
+            d,
+            UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }
+        )
+    }) && k >= 1
+        && dims[k + 1..].iter().all(is_fixed)
     {
         return Some(k);
     }
@@ -95,9 +111,20 @@ pub enum Dim {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CollShape {
     pub dims: Vec<Dim>,
+    /// Bounded queue max lengths (`(dim_idx, max_size + 1)`) for nested bounded queues (`[$:N]`).
+    #[serde(default)]
+    pub queue_bounds: Vec<(usize, u32)>,
 }
 
 impl CollShape {
+    /// Returns the declared max element count (`N + 1` for `[$:N]`) at `depth`, if bounded.
+    pub fn queue_max_size_at(&self, depth: usize) -> Option<u32> {
+        self.queue_bounds
+            .iter()
+            .find(|&&(d, _)| d == depth)
+            .map(|&(_, cap)| cap)
+    }
+
     /// The shape of a declaration with unpacked dimensions `dims` when it is
     /// a collection of collections — two or more dimensions, one of them
     /// dynamic, queue or associative — else `None`: a one-dimensional
@@ -118,20 +145,30 @@ impl CollShape {
         if dims.len() < 2 || dims.iter().all(fixed) {
             return None;
         }
+        let mut queue_bounds = Vec::new();
         let dims: Vec<Dim> = dims
             .iter()
-            .map(|d| match d {
+            .enumerate()
+            .map(|(idx, d)| match d {
                 UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. } => {
                     Dim::Fixed(const_unpacked_bounds(std::slice::from_ref(d), params))
                 }
                 UnpackedDimension::Unsized(_) => Dim::Dyn,
-                UnpackedDimension::Queue { .. } => Dim::Queue,
+                UnpackedDimension::Queue { max_size, .. } => {
+                    if let Some(ms) = max_size
+                        && let Some(n) = const_eval_i64_with_params(ms, params)
+                        && n >= 0
+                    {
+                        queue_bounds.push((idx, (n + 1) as u32));
+                    }
+                    Dim::Queue
+                }
                 UnpackedDimension::Associative { data_type, .. } => {
                     Dim::Assoc(key_kind(data_type.as_deref()))
                 }
             })
             .collect();
-        Some(CollShape { dims })
+        Some(CollShape { dims, queue_bounds })
     }
 }
 
@@ -147,12 +184,23 @@ pub fn coll_key_kind(
         return KeyKind::Wildcard;
     };
     let resolved = typedef_types.map_or(kdt, |t| resolve_typedef_chain(kdt, t));
+    let packed_array_of_type = matches!(
+        kdt,
+        DataType::TypeReference { dimensions, .. } if !dimensions.is_empty()
+    );
+    if !packed_array_of_type
+        && matches!(resolved, DataType::Struct(su) if !su.packed)
+        && let DataType::TypeReference { name, .. } = kdt
+    {
+        return KeyKind::Typed(name.name.name.clone());
+    }
     match resolved {
         DataType::Simple {
             kind: SimpleType::String,
             ..
         } => KeyKind::String,
         DataType::TypeReference { name, .. } => KeyKind::Typed(name.name.name.clone()),
+        DataType::Struct(su) if !su.packed => KeyKind::Unknown,
         dt => match resolve_type_width(dt, params, typedefs) {
             0 => KeyKind::Unknown,
             width => KeyKind::Integral {
@@ -194,16 +242,26 @@ pub fn assoc_key_type_info(
         return (None, None);
     };
     let tn = match kdt {
-        DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+        DataType::TypeReference {
+            name, dimensions, ..
+        } if dimensions.is_empty() => Some(name.name.name.clone()),
         _ => None,
     };
+    let resolved = resolve_typedef_chain(kdt, typedef_types);
     if matches!(
-        resolve_typedef_chain(kdt, typedef_types),
+        resolved,
         DataType::Simple {
             kind: SimpleType::String,
             ..
         }
     ) {
+        return (None, tn);
+    }
+    let packed_array_of_type = matches!(
+        kdt,
+        DataType::TypeReference { dimensions, .. } if !dimensions.is_empty()
+    );
+    if !packed_array_of_type && matches!(resolved, DataType::Struct(su) if !su.packed) {
         return (None, tn);
     }
     let kw = resolve_type_width(kdt, Some(params), Some(typedefs));
@@ -213,15 +271,51 @@ pub fn assoc_key_type_info(
     )
 }
 
+/// If `kdt` names an unpacked struct key type (§7.8.5), return the resolved `Struct` `DataType`.
+pub fn resolve_unpacked_struct_key_type(
+    kdt: Option<&DataType>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<DataType> {
+    let dt = kdt?;
+    if matches!(
+        dt,
+        DataType::TypeReference { dimensions, .. } if !dimensions.is_empty()
+    ) {
+        return None;
+    }
+    let resolved = resolve_typedef_chain(dt, typedef_types);
+    matches!(resolved, DataType::Struct(su) if !su.packed).then(|| resolved.clone())
+}
+
+/// Record wildcard and unpacked-struct key metadata for an associative array on `elab`.
+pub(super) fn register_assoc_key_kind_meta(
+    elab: &mut ElaboratedModule,
+    name: &str,
+    kdt: Option<&DataType>,
+) {
+    match kdt {
+        None => {
+            elab.wildcard_assoc_arrays.insert(name.to_string());
+        }
+        Some(_) => {
+            if let Some(st) = resolve_unpacked_struct_key_type(kdt, &elab.typedef_types) {
+                elab.assoc_key_struct_types.insert(name.to_string(), st);
+            }
+        }
+    }
+}
+
 /// A fixed outer array's associative rows have the same declared key type
 /// as a standalone associative array (§7.8.4 / §12.7.3).
 pub(super) fn register_assoc_element_key_type(
     elab: &mut ElaboratedModule,
     name: String,
+    kdt: Option<&DataType>,
     string_key: bool,
     width: u32,
     key_info: &(Option<(u32, bool)>, Option<String>),
 ) {
+    register_assoc_key_kind_meta(elab, &name, kdt);
     if let Some(index) = key_info.0 {
         elab.assoc_index_widths.insert(name.clone(), index);
     }

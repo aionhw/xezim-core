@@ -430,15 +430,19 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
             let Some(arg) = args.first() else {
                 return Value::zero(32);
             };
-            let inner = if let ExprKind::SystemCall { name, args: a2 } = &arg.kind {
-                if name == "$unsigned" || name == "$signed" {
-                    a2.first().unwrap_or(arg)
-                } else {
-                    arg
+            let mut inner = arg;
+            loop {
+                match &inner.kind {
+                    ExprKind::SystemCall { name, args: a2 }
+                        if matches!(name.as_str(), "$unsigned" | "$signed" | "$__xz_type_op")
+                            && a2.len() == 1 =>
+                    {
+                        inner = &a2[0];
+                    }
+                    ExprKind::Paren(p) => inner = p,
+                    _ => break,
                 }
-            } else {
-                arg
-            };
+            }
             let w: u32 = match &inner.kind {
                 // §7.4.5/§20.6.2: an element or slice of a declared variable
                 // — see the matching arm in `const_eval_i64_with_params`.
@@ -862,7 +866,13 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
             };
             Value::from_u64(result, w)
         }
-        // §20.7 over an explicit type (`$size(logic [7:0])`).
+        // §6.23: `type(expr_or_type)` as a value expression evaluates cleanly
+        // to `1'b0` so constant type comparisons continue to fold.
+        ExprKind::SystemCall { name, .. } if name == "$__xz_type_op" => Value::zero(1),
+        // LRM §20.7 array-introspection in constant expressions: supports
+        // explicit types, `$__xz_type_op(...)`, declared fixed-size variables,
+        // `ARRAYS_TLS`, and typedef/keyword types. Out-of-range / 0 / 'x
+        // dimensions yield signed 32'bx (§20.7).
         ExprKind::SystemCall { name, args }
             if matches!(
                 name.as_str(),
@@ -874,113 +884,91 @@ pub(super) fn eval_const_expr_val_with_ctx<P: ParamLookup>(
                     | "$increment"
                     | "$dimensions"
                     | "$unpacked_dimensions"
-            ) && matches!(
-                args.first().map(|a| &a.kind),
-                Some(ExprKind::TypeLiteral(_))
             ) =>
         {
-            let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) else {
-                unreachable!()
-            };
-            match type_literal_query(name, dt, args, Some(params)) {
-                Some(v) => {
-                    let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
-                    out.is_signed = true;
-                    out
-                }
-                None => Value::new(32),
-            }
-        }
-        // §20.7, §23.6: a query over a generate block's variable by path
-        // (`g[0].arr`) answers from the block's declared shape.
-        ExprKind::SystemCall { name, args }
-            if args
-                .first()
-                .is_some_and(|a| matches!(a.kind, ExprKind::MemberAccess { .. }))
-                && decl_var_query(name, args, Some(params)).is_some() =>
-        {
-            let v = decl_var_query(name, args, Some(params)).unwrap_or_default();
-            let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
-            out.is_signed = true;
-            out
-        }
-        // LRM §20.7 array-introspection on an array-name ident: consults
-        // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
-        // via runtime path before deferred-param eval).
-        ExprKind::SystemCall { name, args }
-            if matches!(
-                name.as_str(),
-                "$size"
-                    | "$left"
-                    | "$right"
-                    | "$high"
-                    | "$low"
-                    | "$increment"
-                    | "$dimensions"
-                    | "$unpacked_dimensions"
-            ) && args
-                .first()
-                .map(|a| matches!(a.kind, ExprKind::Ident(_)))
-                .unwrap_or(false) =>
-        {
-            // §20.7: a declared fixed-size variable answers from its declared
-            // type (see `decl_var_query`); the result is an `integer`.
-            if let Some(v) = decl_var_query(name, args, Some(params)) {
+            let signed_i64_32 = |v: i64| {
                 let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
                 out.is_signed = true;
-                return out;
+                out
+            };
+            let signed_x_32 = || {
+                let mut out = Value::new(32);
+                out.is_signed = true;
+                out
+            };
+            let Some(raw_arg) = args.first() else {
+                return signed_x_32();
+            };
+            let arg = decl_shapes::unwrap_type_op_expr(raw_arg);
+            let dim: usize = if matches!(name.as_str(), "$dimensions" | "$unpacked_dimensions") {
+                1
+            } else if let Some(d_expr) = args.get(1) {
+                let dv = eval_const_expr_val_inner(d_expr, params, types);
+                match dv.to_i64() {
+                    Some(d) if d >= 1 => d as usize,
+                    _ => return signed_x_32(),
+                }
+            } else {
+                1
+            };
+            if let ExprKind::TypeLiteral(dt) = &arg.kind {
+                let q = typedefs_snapshot(|td| {
+                    TYPEDEF_SHAPES_TLS.with(|c| {
+                        type_query_dims_of(dt, Some(params), td, Some(&c.borrow().0))
+                    })
+                });
+                return match type_query_bound(name, &q, dim) {
+                    Some(v) => signed_i64_32(v),
+                    None => signed_x_32(),
+                };
             }
-            let arg = args.first().unwrap();
+            if let Some(res) = decl_var_query_dim(name, arg, dim as i64, Some(params)) {
+                return match res {
+                    Some(v) => signed_i64_32(v),
+                    None => signed_x_32(),
+                };
+            }
             let arr_name = if let ExprKind::Ident(hier) = &arg.kind {
                 hier.path
                     .last()
                     .map(|s| s.name.name.clone())
                     .unwrap_or_default()
             } else {
-                String::new()
+                return Value::zero(32);
             };
             let res =
                 ARRAYS_TLS.with(|ar| ar.borrow().as_ref().and_then(|m| m.get(&arr_name).copied()));
             if let Some((lo, hi, _ndim)) = res {
-                let v: i64 = match name.as_str() {
-                    "$size" => hi - lo + 1,
-                    "$left" => lo,
-                    "$right" => hi,
-                    "$high" => hi.max(lo),
-                    "$low" => lo.min(hi),
-                    "$dimensions" => 1,
-                    _ => 0,
+                let v: Option<i64> = match name.as_str() {
+                    "$dimensions" | "$unpacked_dimensions" => Some(1),
+                    "$size" if dim == 1 => Some(hi - lo + 1),
+                    "$left" if dim == 1 => Some(lo),
+                    "$right" if dim == 1 => Some(hi),
+                    "$high" if dim == 1 => Some(hi.max(lo)),
+                    "$low" if dim == 1 => Some(lo.min(hi)),
+                    "$increment" if dim == 1 => Some(if lo >= hi { 1 } else { -1 }),
+                    _ => None,
                 };
-                Value::from_u64(v as u64, 32)
-            } else if let Some(v) = TYPEDEFS_TLS
-                .with(|td| {
-                    TYPEDEF_SHAPES_TLS.with(|sh| {
-                        let sh = sh.borrow();
-                        type_query_dims_by_name(
-                            &arr_name,
-                            Some(params),
-                            td.borrow().as_ref(),
-                            Some(&sh.0),
-                            Some(&sh.1),
-                        )
-                    })
+                match v {
+                    Some(n) => signed_i64_32(n),
+                    None => signed_x_32(),
+                }
+            } else if let Some(q) = TYPEDEFS_TLS.with(|td| {
+                TYPEDEF_SHAPES_TLS.with(|sh| {
+                    let sh = sh.borrow();
+                    type_query_dims_by_name(
+                        &arr_name,
+                        Some(params),
+                        td.borrow().as_ref(),
+                        Some(&sh.0),
+                        Some(&sh.1),
+                    )
                 })
-                .and_then(|q| {
-                    // §20.7 accepts a TYPE as the operand: `$size(int)` is 32,
-                    // `$left(byte)` 7. The name parses as a plain Ident (see
-                    // `parse_call_args`), so a `localparam W = $size(int)`
-                    // const-folded to ZERO here and every vector sized `[W-1:0]`
-                    // elaborated to `[-1:0]` — two bits.
-                    let dim = args
-                        .get(1)
-                        .and_then(|d| const_eval_i64_with_params_env(d, Some(params)))
-                        .unwrap_or(1) as usize;
-                    type_query_bound(name, &q, dim)
-                })
-            {
-                let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
-                out.is_signed = true;
-                out
+            }) {
+                match type_query_bound(name, &q, dim) {
+                    Some(v) => signed_i64_32(v),
+                    None => signed_x_32(),
+                }
             } else {
                 Value::zero(32)
             }

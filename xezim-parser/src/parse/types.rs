@@ -2,6 +2,7 @@
 
 use super::{Parser, compact_syntax_list};
 use crate::ast::types::*;
+use crate::diagnostics::Diagnostic;
 use crate::lexer::token::TokenKind;
 
 impl<'a> Parser<'a> {
@@ -809,10 +810,46 @@ impl<'a> Parser<'a> {
         if !self.at(TokenKind::Identifier) {
             return false;
         }
-        matches!(
-            self.peek_kind(),
-            TokenKind::RBracket | TokenKind::DoubleColon | TokenKind::Hash
-        )
+        match self.peek_kind() {
+            TokenKind::RBracket | TokenKind::DoubleColon | TokenKind::Hash => true,
+            TokenKind::LBracket => self.has_packed_dims_then_rbracket(),
+            _ => false,
+        }
+    }
+
+    /// Distinguish `aa[typedef_id [MSB:LSB]]` (associative key with packed dims)
+    /// from an array/constant index expression like `aa[arr[0]]`.
+    fn has_packed_dims_then_rbracket(&self) -> bool {
+        let mut i = self.pos + 1;
+        let mut saw_dim = false;
+        while self.tokens.get(i).map(|t| t.kind) == Some(TokenKind::LBracket) {
+            i += 1;
+            let mut depth = 1usize;
+            let mut has_colon = false;
+            while let Some(tok) = self.tokens.get(i) {
+                match tok.kind {
+                    TokenKind::LBracket => depth += 1,
+                    TokenKind::RBracket => {
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                        continue;
+                    }
+                    TokenKind::Colon if depth == 1 => has_colon = true,
+                    TokenKind::Eof => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if depth != 0 || !has_colon {
+                return false;
+            }
+            saw_dim = true;
+        }
+        saw_dim
+            && self.tokens.get(i).map(|t| t.kind) == Some(TokenKind::RBracket)
     }
     fn parse_enum_type(&mut self) -> DataType {
         let start = self.current_span().start;
@@ -1022,10 +1059,39 @@ impl<'a> Parser<'a> {
         let soft = crate::is_sv2023()
             && matches!(kind, StructUnionKind::Union)
             && self.eat(TokenKind::KwSoft).is_some();
-        let packed = self.eat(TokenKind::KwPacked).is_some();
+        // §7.3.1: `union soft` without `packed` is still a packed union.
+        let packed = self.eat(TokenKind::KwPacked).is_some() || soft;
         let tagged2 = self.eat(TokenKind::KwTagged).is_some();
         let tagged = tagged1 || tagged2;
+        if tagged2 {
+            self.diagnostics.push(Diagnostic::error(
+                "'tagged' must appear before 'packed' in a union declaration (IEEE 1800-2023 §7.3.2, Syntax 7-2)"
+                    .to_string(),
+                self.span_from(start),
+            ));
+        }
+        if soft && tagged {
+            self.diagnostics.push(Diagnostic::error(
+                "'soft' and 'tagged' cannot both appear on a union declaration (IEEE 1800-2023 §7.3.1, Syntax 7-2)"
+                    .to_string(),
+                self.span_from(start),
+            ));
+        }
+        if matches!(kind, StructUnionKind::Struct) && tagged {
+            self.diagnostics.push(Diagnostic::error(
+                "'tagged' is only allowed on a union, not a struct (IEEE 1800-2023 §7.2, §7.3.2)"
+                    .to_string(),
+                self.span_from(start),
+            ));
+        }
         let signing = self.parse_optional_signing();
+        if signing.is_some() && !packed && !soft {
+            self.diagnostics.push(Diagnostic::error(
+                "'signed'/'unsigned' is only allowed on a packed struct or union (IEEE 1800-2023 §7.2.1, Syntax 7-1)"
+                    .to_string(),
+                self.span_from(start),
+            ));
+        }
         // Forward / bodyless `struct`/`union` — e.g. the forward typedef
         // `typedef union myu;` (IEEE 1800-2017 §6.18). With no `{`, there is no
         // member list: return an empty aggregate. Without this guard the member
@@ -1060,7 +1126,23 @@ impl<'a> Parser<'a> {
                 }
                 _ => None,
             };
+            if rand_qualifier.is_some() && (packed || matches!(kind, StructUnionKind::Union)) {
+                self.diagnostics.push(Diagnostic::error(
+                    "'rand'/'randc' qualifier is only allowed on members of an unpacked struct (IEEE 1800-2023 §7.2.1, §7.3, §18.4)"
+                        .to_string(),
+                    self.span_from(mstart),
+                ));
+            }
             let data_type = self.parse_data_type();
+            if matches!(data_type, DataType::Void(_))
+                && !(matches!(kind, StructUnionKind::Union) && tagged)
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "'void' member is only allowed in a tagged union (IEEE 1800-2023 §7.2, §7.3.2)"
+                        .to_string(),
+                    self.span_from(mstart),
+                ));
+            }
             let mut declarators = Vec::new();
             loop {
                 let dstart = self.current_span().start;
@@ -1097,6 +1179,13 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::RBrace);
         // Packed array dimensions after the body: `struct packed {...} [N-1:0] x;`
         let dimensions = self.parse_packed_dimensions();
+        if !packed && !soft && !dimensions.is_empty() {
+            self.diagnostics.push(Diagnostic::error(
+                "packed dimensions are not allowed on an unpacked struct or union (IEEE 1800-2023 §7.2.1, §7.4.1)"
+                    .to_string(),
+                self.span_from(start),
+            ));
+        }
         DataType::Struct(StructUnionType {
             kind,
             packed,

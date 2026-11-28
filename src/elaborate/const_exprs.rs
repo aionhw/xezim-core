@@ -52,6 +52,13 @@ pub(super) fn expr_has_call(expr: &Expression) -> bool {
 /// a type of the same name, so only a cross-module coincidence could collide.
 fn array_query_operand_is_type(arg: &Expression) -> bool {
     use crate::ast::expr::ExprKind;
+    let mut arg = arg;
+    while let ExprKind::SystemCall { name, args } = &arg.kind
+        && name == "$__xz_type_op"
+        && let Some(inner) = args.first()
+    {
+        arg = inner;
+    }
     let name = match &arg.kind {
         ExprKind::TypeLiteral(_) => return true,
         ExprKind::Ident(h) => match h.path.last() {
@@ -188,6 +195,8 @@ pub(super) fn is_const_expr<P: ParamLookup>(expr: &Expression, params: &P) -> bo
         {
             args[1..].iter().all(|a| is_const_expr(a, params))
         }
+        // §6.23: `type(expr_or_type)` is always a constant expression.
+        ExprKind::SystemCall { name, .. } if name == "$__xz_type_op" => true,
         // §6.24.1: a cast to a type (`int'(e)`, `T'(e)`, `pkg::T'(e)`) is
         // constant when its operand is; the target is a type, not a value.
         ExprKind::SystemCall { name, args }

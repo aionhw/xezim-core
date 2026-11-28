@@ -846,15 +846,21 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
             // through to None — runtime path still resolves it.
             "$bits" => {
                 let arg = args.first()?;
-                let inner = if let ExprKind::SystemCall { name, args: a2 } = &arg.kind {
-                    if name == "$unsigned" || name == "$signed" {
-                        a2.first()?
-                    } else {
-                        arg
+                let mut inner = arg;
+                loop {
+                    match &inner.kind {
+                        ExprKind::SystemCall { name, args: a2 }
+                            if matches!(
+                                name.as_str(),
+                                "$unsigned" | "$signed" | "$__xz_type_op"
+                            ) && a2.len() == 1 =>
+                        {
+                            inner = &a2[0];
+                        }
+                        ExprKind::Paren(p) => inner = p,
+                        _ => break,
                     }
-                } else {
-                    arg
-                };
+                }
                 match &inner.kind {
                     // §7.4.5/§20.6.2: an element or slice of a declared
                     // variable (`pk[2]` of `logic [3:0][1:0] pk`) has the
@@ -1153,11 +1159,32 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
             | "$increment"
             | "$dimensions"
             | "$unpacked_dimensions" => {
-                let arg = args.first()?;
+                let raw_arg = args.first()?;
+                let arg = decl_shapes::unwrap_type_op_expr(raw_arg);
                 // §20.7: a declared fixed-size variable answers from its
                 // declared type — every dimension, in declared order.
-                if let Some(v) = decl_var_query(name, args, params) {
-                    return Some(v);
+                if let Some(d_expr) = args.get(1)
+                    && !matches!(name.as_str(), "$dimensions" | "$unpacked_dimensions")
+                {
+                    let d = const_eval_i64_with_params_env(d_expr, params)?;
+                    if d < 1 {
+                        return None;
+                    }
+                }
+                if let Some(res) = decl_var_query_dim(
+                    name,
+                    arg,
+                    if matches!(name.as_str(), "$dimensions" | "$unpacked_dimensions") {
+                        1
+                    } else {
+                        match args.get(1) {
+                            Some(d) => const_eval_i64_with_params_env(d, params)?,
+                            None => 1,
+                        }
+                    },
+                    params,
+                ) {
+                    return res;
                 }
                 if let ExprKind::TypeLiteral(dt) = &arg.kind {
                     return type_literal_query(name, dt, args, params);
@@ -1166,31 +1193,34 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                     ExprKind::Ident(hier) => hier.path.last().map(|s| s.name.name.clone())?,
                     _ => return None,
                 };
+                let dim = if matches!(name.as_str(), "$dimensions" | "$unpacked_dimensions") {
+                    1
+                } else {
+                    match args.get(1) {
+                        Some(d) => {
+                            let dv = const_eval_i64_with_params_env(d, params)?;
+                            if dv < 1 {
+                                return None;
+                            }
+                            dv as usize
+                        }
+                        None => 1,
+                    }
+                };
                 ARRAYS_TLS
                     .with(|ar| ar.borrow().as_ref().and_then(|m| m.get(&arr_name).copied()))
                     .and_then(|(lo, hi, _ndim)| {
                         Some(match name.as_str() {
-                            "$size" => hi - lo + 1,
-                            "$left" => lo,
-                            "$right" => hi,
-                            "$high" => hi.max(lo),
-                            "$low" => lo.min(hi),
+                            "$size" if dim == 1 => hi - lo + 1,
+                            "$left" if dim == 1 => lo,
+                            "$right" if dim == 1 => hi,
+                            "$high" if dim == 1 => hi.max(lo),
+                            "$low" if dim == 1 => lo.min(hi),
                             "$dimensions" => 1,
-                            // $increment and $unpacked_dimensions over an array need
-                            // the DECLARED order / full dimension list, which this
-                            // (lo, hi, ndim) table has already normalized away — leave
-                            // them to the runtime rather than answer wrongly.
                             _ => return None,
                         })
                     })
-                    // §20.7 also accepts a TYPE as the operand — `$size(int)` is
-                    // 32, `$left(byte)` 7. The name parses as a plain Ident (see
-                    // `parse_call_args`), so a `localparam W = $size(int)` used as
-                    // a vector width const-folded to nothing and the vector
-                    // elaborated one bit wide.
                     .or_else(|| {
-                        // The full typedef definitions (TYPEDEF_SHAPES_TLS)
-                        // count an unpacked typedef's dimensions too.
                         let q = TYPEDEFS_TLS.with(|td| {
                             TYPEDEF_SHAPES_TLS.with(|sh| {
                                 let sh = sh.borrow();
@@ -1203,17 +1233,12 @@ pub fn const_eval_i64_with_params_env<P: ParamLookup>(
                                 )
                             })
                         })?;
-                        // Width-only typedef knowledge cannot count dimensions;
-                        // leave those to the runtime rather than answer wrongly.
                         if q.dims.is_empty()
+                            && !q.is_string
                             && matches!(name.as_str(), "$dimensions" | "$unpacked_dimensions")
                         {
                             return None;
                         }
-                        let dim = match args.get(1) {
-                            Some(d) => const_eval_i64_with_params_env(d, params)? as usize,
-                            None => 1,
-                        };
                         type_query_bound(name, &q, dim)
                     })
             }

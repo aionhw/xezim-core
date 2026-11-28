@@ -718,11 +718,6 @@ fn register_shape(elab: &mut ElaboratedModule, name: &str, shape: &[(i64, i64)],
                 .insert(name.to_string(), (shape.to_vec(), width));
         }
     }
-    if shape.len() > 1 {
-        for index in left.min(right)..=left.max(right) {
-            register_shape(elab, &format!("{name}[{index}]"), &shape[1..], width);
-        }
-    }
 }
 
 /// Is a nested array's `default:` value a row literal? A pattern or a

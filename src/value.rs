@@ -1607,6 +1607,69 @@ impl Value {
         }
     }
 
+    /// Build a 4-state value from little-endian value and x/z word slices.
+    pub fn from_val_xz_words(v: &[u64], x: &[u64], width: u32, signed: bool) -> Value {
+        if width <= 64 {
+            let mut val = Value::from_inline(
+                v.first().copied().unwrap_or(0),
+                x.first().copied().unwrap_or(0),
+                width,
+            );
+            val.is_signed = signed;
+            return val;
+        }
+        let n = WidePlanes::nwords(width);
+        let mut val: Vec<u64> = (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect();
+        let mut xz: Vec<u64> = (0..n).map(|i| x.get(i).copied().unwrap_or(0)).collect();
+        let r = width % 64;
+        if r != 0 {
+            let mask = (1u64 << r) - 1;
+            val[n - 1] &= mask;
+            xz[n - 1] &= mask;
+        }
+        Value {
+            storage: ValueStorage::Wide(Box::new(WidePlanes {
+                val,
+                xz,
+                nbits: width,
+            })),
+            width,
+            is_signed: signed,
+            is_real: false,
+            is_fill: false,
+        }
+    }
+
+    /// Extract little-endian value and x/z words from `self` into `out_val` and
+    /// `out_xz` (whose length must match `WidePlanes::nwords(self.width)`).
+    pub fn write_val_xz_words(&self, out_val: &mut [u64], out_xz: &mut [u64]) {
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if !out_val.is_empty() {
+                    out_val[0] = *val_bits;
+                    out_xz[0] = *xz_bits;
+                }
+                for w in out_val.iter_mut().skip(1) {
+                    *w = 0;
+                }
+                for w in out_xz.iter_mut().skip(1) {
+                    *w = 0;
+                }
+            }
+            ValueStorage::Wide(bits) => {
+                let n = out_val.len().min(bits.val.len());
+                out_val[..n].copy_from_slice(&bits.val[..n]);
+                out_xz[..n].copy_from_slice(&bits.xz[..n]);
+                for w in &mut out_val[n..] {
+                    *w = 0;
+                }
+                for w in &mut out_xz[n..] {
+                    *w = 0;
+                }
+            }
+        }
+    }
+
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
@@ -1647,6 +1710,87 @@ impl Value {
                     }
                 }
                 out
+            }
+        }
+    }
+
+    /// Convert X/Z bits to `0` at every position where `mask` is `1`,
+    /// returning `true` if any bit changed.
+    pub fn clear_xz_with_mask(&mut self, mask: &Value) -> bool {
+        if self.is_real || mask.is_real || !self.has_xz() {
+            return false;
+        }
+        match (&mut self.storage, &mask.storage) {
+            (
+                ValueStorage::Inline {
+                    val_bits: dv,
+                    xz_bits: dx,
+                },
+                ValueStorage::Inline {
+                    val_bits: mv,
+                    xz_bits: mx,
+                },
+            ) => {
+                let m = *mv & !*mx;
+                let cleared = *dx & m;
+                if cleared == 0 {
+                    return false;
+                }
+                *dv &= !cleared;
+                *dx &= !cleared;
+                true
+            }
+            (ValueStorage::Wide(d), ValueStorage::Wide(m)) => {
+                let mut changed = false;
+                let n = d.val.len().min(m.val.len());
+                for i in 0..n {
+                    let mw = m.val[i] & !m.xz[i];
+                    let cleared = d.xz[i] & mw;
+                    if cleared != 0 {
+                        d.val[i] &= !cleared;
+                        d.xz[i] &= !cleared;
+                        changed = true;
+                    }
+                }
+                changed
+            }
+            (
+                ValueStorage::Wide(d),
+                ValueStorage::Inline {
+                    val_bits: mv,
+                    xz_bits: mx,
+                },
+            ) => {
+                if d.val.is_empty() {
+                    return false;
+                }
+                let m = *mv & !*mx;
+                let cleared = d.xz[0] & m;
+                if cleared == 0 {
+                    return false;
+                }
+                d.val[0] &= !cleared;
+                d.xz[0] &= !cleared;
+                true
+            }
+            (
+                ValueStorage::Inline {
+                    val_bits: dv,
+                    xz_bits: dx,
+                },
+                ValueStorage::Wide(m),
+            ) => {
+                if m.val.is_empty() {
+                    return false;
+                }
+                let mw = m.val[0] & !m.xz[0];
+                let cleared = *dx & mw;
+                if cleared == 0 {
+                    return false;
+                }
+                *dv &= !cleared;
+                *dx &= !cleared;
+                true
             }
         }
     }
@@ -4867,6 +5011,29 @@ mod tests {
         assert_eq!(wide_target.get_bit(31), LogicBit::Zero);
         assert_eq!(wide_target.get_bit(160), LogicBit::Zero);
         assert!(!wide_target.copy_bits_from(32, &wide_source, 0, 128));
+    }
+
+    #[test]
+    fn clear_xz_with_mask_inline_and_wide() {
+        let mut v = Value::from_str_radix("xz10xz10", 2, 8);
+        let mask = Value::from_u64(0b1111_0000, 8);
+        assert!(v.clear_xz_with_mask(&mask));
+        assert_eq!(v.to_bin(), "0010xz10");
+        assert!(!v.clear_xz_with_mask(&mask));
+
+        let mut wide = Value::new(130);
+        wide.set_bit(129, LogicBit::Z);
+        let mut wmask = Value::zero(130);
+        wmask.set_bit(2, LogicBit::One);
+        wmask.set_bit(70, LogicBit::One);
+        wmask.set_bit(129, LogicBit::One);
+        assert!(wide.clear_xz_with_mask(&wmask));
+        assert_eq!(wide.get_bit(2), LogicBit::Zero);
+        assert_eq!(wide.get_bit(70), LogicBit::Zero);
+        assert_eq!(wide.get_bit(129), LogicBit::Zero);
+        assert_eq!(wide.get_bit(0), LogicBit::X);
+        assert_eq!(wide.get_bit(69), LogicBit::X);
+        assert!(!wide.clear_xz_with_mask(&wmask));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub fn elaborate_module_with_defs(
     seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
     PACKED_WIDTH_ERROR.with(|slot| slot.take());
+    let _design_ast_blob_guard = DesignAstBlobGuard::enter();
     let _oom_trace = crate::oom_trace::session();
     let _oom_definition = crate::oom_trace::definition(module, "elaborate module", module.name());
     let _top_decl_types = crate::decl_types::top_decl_types_scope();
@@ -387,6 +388,7 @@ pub fn elaborate_module_with_defs(
             }
         }
     }
+    let mut flat_cache = FlattenStructCache::default();
     // Process parameters
     for param in module.params_and_body_types() {
         if let ParameterKind::Data {
@@ -1277,6 +1279,9 @@ pub fn elaborate_module_with_defs(
             {
                 check_enum_member_duplicates(td, &elab)?;
                 process_local_typedef(td, &mut elab);
+                if !td.forward {
+                    check_hard_packed_union_widths(&td.data_type, &elab, td.span)?;
+                }
             }
         }
     }
@@ -1546,6 +1551,7 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::NetDeclaration(nd) => {
                 check_net_data_type(nd, &elab)?;
+                check_hard_packed_union_widths(&nd.data_type, &elab, nd.span)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
@@ -1887,6 +1893,7 @@ pub fn elaborate_module_with_defs(
                 // simulation time. Surfaced by cv32e40p_obi_interface.sv's
                 // `state_q FSM`. Helper is also called from the other
                 // DataDeclaration arms (submodule items, generate items).
+                check_hard_packed_union_widths(&dd.data_type, &elab, dd.span)?;
                 register_anonymous_enum_members(&dd.data_type, &mut elab);
                 // §6.19.6: an anonymous `enum {...} v;` variable needs its
                 // ordered member list so `v.num/first/last/next/prev` resolve.
@@ -2171,6 +2178,7 @@ pub fn elaborate_module_with_defs(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
+                        register_assoc_key_kind_meta(&mut elab, &decl.name.name, key_dt.as_deref());
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -2364,17 +2372,53 @@ pub fn elaborate_module_with_defs(
                                             .entry(name.clone())
                                             .or_insert_with(|| f.clone());
                                     }
-                                    let assoc_key_info = match qd {
-                                        UnpackedDimension::Associative { data_type, .. } => {
+                                    let (assoc_kdt, assoc_key_info) = match qd {
+                                        UnpackedDimension::Associative { data_type, .. } => (
+                                            data_type.as_deref(),
                                             assoc_key_type_info(
                                                 data_type.as_deref(),
                                                 &elab.parameters,
                                                 &elab.typedefs,
                                                 &elab.typedef_types,
-                                            )
-                                        }
-                                        _ => (None, None),
+                                            ),
+                                        ),
+                                        _ => (None, (None, None)),
                                     };
+                                    let is_queue = matches!(qd, UnpackedDimension::Queue { .. });
+                                    let tail = &effective_dims[split + 1..];
+                                    let tail_shape: Option<Vec<(i64, i64)>> = (!tail.is_empty()
+                                        && assoc_key.is_none()
+                                        && tail.iter().all(|d| {
+                                            matches!(
+                                                d,
+                                                UnpackedDimension::Range { .. }
+                                                    | UnpackedDimension::Expression { .. }
+                                            )
+                                        }))
+                                    .then(|| {
+                                        tail.iter()
+                                            .map(|d| {
+                                                extract_array_range(
+                                                    std::slice::from_ref(d),
+                                                    &elab.parameters,
+                                                )
+                                            })
+                                            .collect::<Option<Vec<_>>>()
+                                    })
+                                    .flatten()
+                                    .filter(|sh| {
+                                        sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                    });
+                                    let tail_decl = tail_shape.as_ref().and_then(|_| {
+                                        declared_unpacked_dims(tail, &elab.parameters)
+                                    });
+                                    let is_two_state = is_type_two_state_resolved(
+                                        &dd.data_type,
+                                        &elab.typedef_types,
+                                    );
+                                    if is_two_state {
+                                        elab.two_state_signals.insert(name.clone());
+                                    }
                                     for suffix in index_tuples(&shape) {
                                         let en = format!("{}{}", name, suffix);
                                         if let Some(f) = &elem_fields {
@@ -2388,19 +2432,64 @@ pub fn elaborate_module_with_defs(
                                             register_assoc_element_key_type(
                                                 &mut elab,
                                                 en,
+                                                assoc_kdt,
                                                 is_str,
                                                 width,
                                                 &assoc_key_info,
                                             );
                                             continue;
                                         }
+                                        if is_two_state {
+                                            elab.two_state_signals.insert(en.clone());
+                                        }
                                         elab.dynamic_arrays.insert(en.clone());
+                                        if is_queue {
+                                            elab.queue_vars.insert(en.clone());
+                                        }
                                         if let Some(m) = qmax {
                                             elab.queue_max_sizes.insert(en.clone(), m);
                                         }
-                                        elab.arrays.insert(en, (0, 63, width));
+                                        if let Some(inner) = &tail_shape {
+                                            if let Some(td) = &tail_decl {
+                                                let mut all = vec![(0i64, -1i64)];
+                                                all.extend(td.iter().copied());
+                                                elab.unpacked_decl_dims.insert(en.clone(), all);
+                                            }
+                                            if inner.len() == 1 {
+                                                elab.arrays_2d
+                                                    .insert(en.clone(), ((0, -1), inner[0], width));
+                                            } else {
+                                                let mut full = vec![(0i64, -1i64)];
+                                                full.extend(inner.iter().copied());
+                                                elab.arrays_nd.insert(en.clone(), (full, width));
+                                            }
+                                            elab.var_decl_types
+                                                .insert(en.clone(), dd.data_type.clone());
+                                            if let DataType::TypeReference { name: tn, .. } =
+                                                &dd.data_type
+                                            {
+                                                elab.array_elem_class
+                                                    .insert(en, tn.name.name.clone());
+                                            }
+                                        } else {
+                                            elab.var_decl_types
+                                                .insert(en.clone(), dd.data_type.clone());
+                                            elab.arrays.insert(en, (0, -1, width));
+                                        }
                                     }
                                     elab.var_decl_types.insert(name, dd.data_type.clone());
+                                    if let Some(init_expr) = &decl.init {
+                                        elab.initial_blocks.push(InitialBlock {
+                                            stmt: Statement::new(
+                                                StatementKind::BlockingAssign {
+                                                    lvalue: make_ident_expr(&decl.name.name),
+                                                    rvalue: init_expr.as_ref().clone(),
+                                                },
+                                                Span::dummy(),
+                                            ),
+                                            scope: String::new(),
+                                        });
+                                    }
                                     continue;
                                 }
                             }
@@ -2606,20 +2695,23 @@ pub fn elaborate_module_with_defs(
                             if let Some(dd) =
                                 declared_unpacked_dims(&effective_dims[1..], &elab.parameters)
                             {
-                                let mut all = vec![(0i64, 63i64)];
+                                let mut all = vec![(0i64, -1i64)];
                                 all.extend(dd);
                                 elab.unpacked_decl_dims.insert(name.clone(), all);
                             }
                             if inner.len() == 1 {
                                 elab.arrays_2d
-                                    .insert(name.clone(), ((0, 63), inner[0], width));
+                                    .insert(name.clone(), ((0, -1), inner[0], width));
                             } else {
-                                let mut shape = vec![(0i64, 63i64)];
+                                let mut shape = vec![(0i64, -1i64)];
                                 shape.extend(inner.iter().cloned());
                                 elab.arrays_nd.insert(name.clone(), (shape, width));
                             }
                             elab.var_decl_types
                                 .insert(name.clone(), dd.data_type.clone());
+                            if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
+                                elab.two_state_signals.insert(name.clone());
+                            }
                             if let DataType::TypeReference { name: tn, .. } = &dd.data_type {
                                 elab.array_elem_class
                                     .insert(name.clone(), tn.name.name.clone());
@@ -3208,6 +3300,8 @@ pub fn elaborate_module_with_defs(
                         // itself can't recover the owner.
                         let layout_own;
                         let layout_stacked;
+                        let has_scoped_owner =
+                            scoped_type_owner(&dd.data_type, &elab.typedef_types).is_some();
                         let layout_params: &dyn ParamLookup =
                             match scoped_type_owner(&dd.data_type, &elab.typedef_types) {
                                 Some(pkg) => {
@@ -3220,14 +3314,29 @@ pub fn elaborate_module_with_defs(
                                 }
                                 None => &elab.parameters,
                             };
-                        if let Some(fields) = flatten_struct_fields(
-                            dt_resolved,
-                            layout_params,
-                            &elab.typedefs,
-                            &elab.typedef_types,
-                        ) {
+                        // Memoize bare named types in `flat_cache` when the
+                        // env is standard `&elab.parameters`; otherwise compute
+                        // once and reuse across all three registration blocks.
+                        let cached_fields_owned = if !has_scoped_owner {
+                            flat_cache.flatten_cached(
+                                &dd.data_type,
+                                layout_params,
+                                elab.parameters.len(),
+                                &elab.typedefs,
+                                &elab.typedef_types,
+                                false,
+                            )
+                        } else {
+                            flatten_struct_fields(
+                                dt_resolved,
+                                layout_params,
+                                &elab.typedefs,
+                                &elab.typedef_types,
+                            )
+                        };
+                        if let Some(ref fields) = cached_fields_owned {
                             if !fields.is_empty() {
-                                tls_register_struct_layout(&decl.name.name, &fields);
+                                tls_register_struct_layout(&decl.name.name, fields);
                                 // Only register packed-struct layouts in
                                 // `packed_struct_fields`. Unpacked structs
                                 // store members as separate signals (see the
@@ -3237,40 +3346,38 @@ pub fn elaborate_module_with_defs(
                                 if let DataType::Struct(su) = dt_resolved {
                                     if su.packed {
                                         elab.packed_struct_fields
-                                            .insert(decl.name.name.clone(), fields);
+                                            .insert(decl.name.name.clone(), fields.clone());
                                     }
                                 }
                             }
                         }
-                        // §7.4.2: a PACKED ARRAY of packed struct
-                        // (`typedef word [1:0] dword; dword foo;`) is one
-                        // contiguous vector of N structs. `dt_resolved` is a
-                        // TypeReference (not a bare Struct), so the block above
-                        // does not register it. Register the element's field
-                        // layout (element-relative offsets) under `foo` plus the
-                        // element width, so `foo[i].field` resolves to
-                        // `i*elem_w + field_off` in the single backing signal.
                         // §7.4.2 packed dims written on a STRUCT TYPEDEF
-                        // (`some_t [0:0][1:0] arr;`). Registered independently of
-                        // the field-layout block below, which is skipped once
-                        // `packed_struct_fields` already holds the name — that is
-                        // exactly the case for a struct-typed declaration, so the
-                        // dimensions were never recorded and `arr[i]` decayed to a
-                        // 1-bit select.
+                        // (`some_t [0:0][1:0] arr;`).
                         if decl.dimensions.is_empty()
                             && !elab.packed_full_dims.contains_key(&decl.name.name)
                         {
-                            let chain2 =
-                                resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone();
-                            if matches!(&chain2, DataType::Struct(su) if su.packed) {
-                                let sw = flatten_struct_fields(
-                                    &chain2,
-                                    &elab.parameters,
-                                    &elab.typedefs,
-                                    &elab.typedef_types,
-                                )
-                                .map(|f| f.iter().map(|(_, o, w)| o + w).max().unwrap_or(0))
-                                .unwrap_or(0);
+                            if matches!(dt_resolved, DataType::Struct(su) if su.packed) {
+                                let base_fields = if !has_scoped_owner {
+                                    cached_fields_owned.as_deref()
+                                } else {
+                                    None
+                                };
+                                let computed_base;
+                                let fields_for_sw = match base_fields {
+                                    Some(f) => Some(f),
+                                    None => {
+                                        computed_base = flatten_struct_fields(
+                                            dt_resolved,
+                                            &elab.parameters,
+                                            &elab.typedefs,
+                                            &elab.typedef_types,
+                                        );
+                                        computed_base.as_deref()
+                                    }
+                                };
+                                let sw = fields_for_sw
+                                    .map(|f| f.iter().map(|(_, o, w)| o + w).max().unwrap_or(0))
+                                    .unwrap_or(0);
                                 if let Some(fdims) =
                                     packed_typedef_array_dims(&dd.data_type, sw, &elab.parameters)
                                 {
@@ -3289,24 +3396,21 @@ pub fn elaborate_module_with_defs(
                         if !elab.packed_struct_fields.contains_key(&decl.name.name)
                             && decl.dimensions.is_empty()
                         {
-                            let chain =
-                                resolve_typedef_chain(dt_resolved, &elab.typedef_types).clone();
-                            if let DataType::Struct(su) = &chain {
+                            if let DataType::Struct(su) = dt_resolved {
                                 if su.packed {
-                                    if let Some(fields) = flatten_struct_fields(
-                                        &chain,
-                                        &elab.parameters,
-                                        &elab.typedefs,
-                                        &elab.typedef_types,
-                                    ) {
+                                    let fields_opt = if !has_scoped_owner {
+                                        cached_fields_owned
+                                    } else {
+                                        flatten_struct_fields(
+                                            dt_resolved,
+                                            &elab.parameters,
+                                            &elab.typedefs,
+                                            &elab.typedef_types,
+                                        )
+                                    };
+                                    if let Some(fields) = fields_opt {
                                         let struct_w =
                                             fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-                                        // Packed dims written on the TYPEDEF itself
-                                        // (`some_t [0:0][1:0] arr;`). Register the
-                                        // full dimension list — including a single
-                                        // `[0:0]`, where `width == struct_w` and the
-                                        // element gate below never fired, leaving
-                                        // `arr[0]` a 1-bit select.
                                         if let Some(fdims) = packed_typedef_array_dims(
                                             &dd.data_type,
                                             struct_w,
@@ -3434,7 +3538,24 @@ pub fn elaborate_module_with_defs(
                                                         }
                                                     )
                                                 });
-                                                elab.associative_arrays.insert(key, is_str);
+                                                elab.associative_arrays.insert(key.clone(), is_str);
+                                                register_assoc_key_kind_meta(
+                                                    &mut elab,
+                                                    &key,
+                                                    kdt.as_deref(),
+                                                );
+                                                let (kiw, ktn) = assoc_key_type_info(
+                                                    kdt.as_deref(),
+                                                    &elab.parameters,
+                                                    &elab.typedefs,
+                                                    &elab.typedef_types,
+                                                );
+                                                if let Some(iw) = kiw {
+                                                    elab.assoc_index_widths.insert(key.clone(), iw);
+                                                }
+                                                if let Some(tn) = ktn {
+                                                    elab.assoc_key_type_names.insert(key, tn);
+                                                }
                                             }
                                             _ => {
                                                 elab.dynamic_arrays.insert(key.clone());
@@ -3459,7 +3580,7 @@ pub fn elaborate_module_with_defs(
                                                             .insert(key.clone(), (n + 1) as u32);
                                                     }
                                                 }
-                                                elab.arrays.insert(key, (0, 63, mw));
+                                                elab.arrays.insert(key, (0, -1, mw));
                                             }
                                         }
                                     }
@@ -3543,43 +3664,15 @@ pub fn elaborate_module_with_defs(
                                 // Recursive: an array member expands per element and a
                                 // nested packed member gets its own slice layout, so
                                 // `c.nodes[1].status` addresses its own signal.
+                                // Member defaults (§7.2.2) are seeded before any
+                                // declaration initializers execute, so an explicit
+                                // declaration initializer (`def_s_t d = '{...};`)
+                                // overrides defaults rather than being overwritten.
                                 register_unpacked_aggregate(
                                     &mut elab,
                                     &decl.name.name,
                                     &dd.data_type,
                                 );
-                                let mut stmts: Vec<Statement> = Vec::new();
-                                for member in &su.members {
-                                    for mdecl in &member.declarators {
-                                        if let Some(init) = &mdecl.init {
-                                            let lval = Expression::new(
-                                                ExprKind::MemberAccess {
-                                                    expr: Box::new(make_ident_expr(
-                                                        &decl.name.name,
-                                                    )),
-                                                    member: mdecl.name.clone(),
-                                                },
-                                                Span::dummy(),
-                                            );
-                                            stmts.push(Statement::new(
-                                                StatementKind::BlockingAssign {
-                                                    lvalue: lval,
-                                                    rvalue: init.clone(),
-                                                },
-                                                Span::dummy(),
-                                            ));
-                                        }
-                                    }
-                                }
-                                if !stmts.is_empty() {
-                                    elab.initial_blocks.push(InitialBlock {
-                                        stmt: Statement::new(
-                                            StatementKind::SeqBlock { name: None, stmts: stmts.into() },
-                                            Span::dummy(),
-                                        ),
-                                        scope: String::new(),
-                                    });
-                                }
                             }
                         }
                     }
@@ -3965,6 +4058,9 @@ pub fn elaborate_module_with_defs(
                     });
                 }
                 process_local_typedef(td, &mut elab);
+                if !td.forward {
+                    check_hard_packed_union_widths(&td.data_type, &elab, td.span)?;
+                }
             }
             ModuleItem::TimeunitsDecl(td) => {
                 if let Some(u) = &td.unit {

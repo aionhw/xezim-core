@@ -331,7 +331,8 @@ pub(super) fn check_net_data_type(
     nd: &crate::ast::decl::NetDeclaration,
     elab: &ElaboratedModule,
 ) -> Result<(), String> {
-    let bad = match &nd.data_type {
+    let resolved = resolve_typedef_chain(&nd.data_type, &elab.typedef_types);
+    let bad = match resolved {
         DataType::TypeReference { name, .. }
             if elab.classes.contains_key(&name.name.name)
                 && elab
@@ -340,6 +341,11 @@ pub(super) fn check_net_data_type(
                     .is_none_or(|dt| matches!(dt, DataType::Void(_))) =>
         {
             Some(format!("class type '{}'", name.name.name))
+        }
+        DataType::Struct(su)
+            if matches!(su.kind, StructUnionKind::Union) && !su.packed && !su.soft =>
+        {
+            Some("unpacked union".to_string())
         }
         DataType::Simple { kind, .. } => Some(format!("{:?}", kind).to_lowercase()),
         _ => None,
@@ -352,6 +358,80 @@ pub(super) fn check_net_data_type(
         )),
         None => Ok(()),
     }
+}
+
+/// IEEE 1800-2023 §7.3.1: every member of a hard (non-`soft`, non-`tagged`)
+/// packed union shall be the same bit size.
+pub(super) fn check_hard_packed_union_widths(
+    dt: &DataType,
+    elab: &ElaboratedModule,
+    span: Span,
+) -> Result<(), String> {
+    check_hard_packed_union_widths_with_params(dt, &elab.parameters, elab, span)
+}
+
+pub(super) fn check_hard_packed_union_widths_with_params(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+    span: Span,
+) -> Result<(), String> {
+    fn check_inner(
+        dt: &DataType,
+        params: &HashMap<String, Value>,
+        elab: &ElaboratedModule,
+        span: Span,
+        depth: u32,
+    ) -> Result<(), String> {
+        if depth > 16 {
+            return Ok(());
+        }
+        let DataType::Struct(su) = resolve_typedef_chain(dt, &elab.typedef_types) else {
+            return Ok(());
+        };
+        if matches!(su.kind, StructUnionKind::Union) && su.packed && !su.soft && !su.tagged {
+            let mut expected: Option<u32> = None;
+            for m in &su.members {
+                // Skip width comparison if a member references an unresolved typedef or void.
+                if let DataType::TypeReference { name, .. } = &m.data_type
+                    && lookup_scoped_type(name, &elab.typedefs).is_none()
+                    && !elab.typedefs.contains_key(&name.name.name)
+                    && lookup_scoped_type(name, &elab.typedef_types).is_none()
+                    && !elab.typedef_types.contains_key(&name.name.name)
+                {
+                    continue;
+                }
+                let base_w = resolve_type_width(&m.data_type, Some(params), Some(&elab.typedefs));
+                if base_w == 0 {
+                    continue;
+                }
+                for d in &m.declarators {
+                    let mw = base_w
+                        .saturating_mul(unpacked_dims_elem_count(&d.dimensions, Some(params)));
+                    if let Some(prev) = expected {
+                        if prev != mw {
+                            return Err(span_error(
+                                elab,
+                                span,
+                                &format!(
+                                    "all members of a hard packed union must have the same bit width \
+                                     (found {prev} and {mw} bits on member '{}'; IEEE 1800-2023 §7.3.1)",
+                                    d.name.name
+                                ),
+                            ));
+                        }
+                    } else {
+                        expected = Some(mw);
+                    }
+                }
+            }
+        }
+        for m in &su.members {
+            check_inner(&m.data_type, params, elab, span, depth + 1)?;
+        }
+        Ok(())
+    }
+    check_inner(dt, params, elab, span, 0)
 }
 
 pub(super) fn validate_expr_idents(

@@ -2712,6 +2712,7 @@ pub(super) fn inline_instantiation_items(
                         &fields,
                     );
                 }
+                let mut inst_flat_cache = FlattenStructCache::default();
 
                 // Bind NON-overridden `parameter type` DEFAULTS as scoped
                 // typedefs, resolving their width against the sub-instance's
@@ -2853,11 +2854,13 @@ pub(super) fn inline_instantiation_items(
                                 let fields = if member_wise {
                                     None
                                 } else {
-                                    flatten_struct_fields(
+                                    inst_flat_cache.flatten_cached(
                                         dt,
                                         &sub_merged_params,
+                                        sub_merged_params.len(),
                                         &elab.typedefs,
                                         &elab.typedef_types,
+                                        false,
                                     )
                                 };
                                 if let Some(fields) = fields {
@@ -3181,6 +3184,14 @@ pub(super) fn inline_instantiation_items(
                 iprof_since("ck4_before_loopB", __th);
                 for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
+                        if !td.forward {
+                            check_hard_packed_union_widths_with_params(
+                                &td.data_type,
+                                &sub_merged_params,
+                                elab,
+                                td.span,
+                            )?;
+                        }
                         if let DataType::Enum(et) = &td.data_type {
                             let base_width = et
                                 .base_type
@@ -3857,20 +3868,37 @@ pub(super) fn inline_instantiation_items(
                                         sub_mod.name(),
                                     ),
                                 );
-                                if matches!(resolve_typedef_chain(&nd.data_type, &elab.typedef_types),
-                                    DataType::Struct(su) if su.packed)
-                                    && let Some(fields) = flatten_struct_fields(
-                                    &nd.data_type, &sub_merged_params,
-                                    &elab.typedefs, &elab.typedef_types,
-                                ) {
-                                    if !fields.is_empty() {
-                                        let element_width = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-                                        if element_width > 0 && width > element_width && width % element_width == 0 {
-                                            elab.packed_signal_elem_widths.insert(sig_name.clone(), element_width);
-                                        }
-                                        tls_register_struct_layout(&sig_name, &fields);
-                                        elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                let is_packed_struct = matches!(
+                                    resolve_typedef_chain(&nd.data_type, &elab.typedef_types),
+                                    DataType::Struct(su) if su.packed
+                                );
+                                let packed_fields = if is_packed_struct {
+                                    inst_flat_cache.flatten_cached(
+                                        &nd.data_type,
+                                        &sub_merged_params,
+                                        sub_merged_params.len(),
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                        false,
+                                    )
+                                } else {
+                                    None
+                                };
+                                if let Some(ref fields) = packed_fields
+                                    && !fields.is_empty()
+                                {
+                                    let element_width =
+                                        fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                    if element_width > 0
+                                        && width > element_width
+                                        && width % element_width == 0
+                                    {
+                                        elab.packed_signal_elem_widths
+                                            .insert(sig_name.clone(), element_width);
                                     }
+                                    tls_register_struct_layout(&sig_name, fields);
+                                    elab.packed_struct_fields
+                                        .insert(sig_name.clone(), fields.clone());
                                 }
                                 let net_is_real =
                                     is_type_real_resolved(&nd.data_type, &elab.typedef_types);
@@ -3883,20 +3911,8 @@ pub(super) fn inline_instantiation_items(
                                 // §7.2.1, §6.7.1: a packed-struct NET's declared
                                 // type and field layout, as the top-level net
                                 // arm and this instance's variable and port arms
-                                // register them. Without the layout a member
-                                // read (`n.a`) did not resolve to the net's
-                                // bits, so a reader was never woken by the net
-                                // and kept a stale value; the same declaration
-                                // in the top module worked.
-                                if let DataType::Struct(su) =
-                                    resolve_typedef_chain(&nd.data_type, &elab.typedef_types)
-                                    && su.packed
-                                    && let Some(fields) = flatten_struct_fields(
-                                        &nd.data_type,
-                                        &sub_merged_params,
-                                        &elab.typedefs,
-                                        &elab.typedef_types,
-                                    )
+                                // register them.
+                                if let Some(fields) = packed_fields
                                     && !fields.is_empty()
                                 {
                                     elab.var_decl_types.insert(
@@ -4544,26 +4560,115 @@ pub(super) fn inline_instantiation_items(
                                         }
                                     }
                                 }
+                                let dyn_outer_fixed_tail = effective_decl_dims.len() >= 2
+                                    && effective_decl_dims.first().is_some_and(|d| {
+                                        matches!(
+                                            d,
+                                            UnpackedDimension::Unsized(_)
+                                                | UnpackedDimension::Queue { .. }
+                                        )
+                                    })
+                                    && effective_decl_dims[1..].iter().all(|d| {
+                                        matches!(
+                                            d,
+                                            UnpackedDimension::Range { .. }
+                                                | UnpackedDimension::Expression { .. }
+                                        )
+                                    });
                                 match effective_decl_dims.first() {
                                     Some(UnpackedDimension::Unsized(_))
                                     | Some(UnpackedDimension::Queue { .. }) => {
                                         elab.dynamic_arrays.insert(sig_name.clone());
+                                        if let Some(UnpackedDimension::Queue {
+                                            max_size, ..
+                                        }) = effective_decl_dims.first()
+                                        {
+                                            elab.queue_vars.insert(sig_name.clone());
+                                            if let Some(ms) = max_size
+                                                && let Some(n) = const_eval_i64_with_params(
+                                                    ms,
+                                                    Some(&sub_merged_params),
+                                                )
+                                                .filter(|n| *n >= 0)
+                                            {
+                                                elab.queue_max_sizes
+                                                    .insert(sig_name.clone(), (n + 1) as u32);
+                                            }
+                                        }
+                                        let dt_for_type = instance_decl_type(
+                                            &mut cache.decl_types,
+                                            &dd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                            sub_mod.name(),
+                                        );
+                                        if is_type_two_state_resolved(
+                                            &dt_for_type,
+                                            &elab.typedef_types,
+                                        ) || is_type_two_state_resolved(
+                                            &dd.data_type,
+                                            &elab.typedef_types,
+                                        ) {
+                                            elab.two_state_signals.insert(sig_name.clone());
+                                        }
+                                        if let DataType::TypeReference { name: tn, .. } =
+                                            &dd.data_type
+                                        {
+                                            elab.array_elem_class
+                                                .insert(sig_name.clone(), tn.name.name.clone());
+                                        }
                                         // The ELEMENT type, under the scoped
                                         // name — without it a queue of unpacked
                                         // structs inside an instance evaluated
                                         // `push_back(item)` as one packed value
                                         // (always x) instead of copying member
                                         // signals, so the queue filled with x.
-                                        elab.var_decl_types.insert_shared(
-                                            sig_name.clone(),
-                                            instance_decl_type(
-                                                &mut cache.decl_types,
-                                                &dd.data_type,
-                                                &sub_typedef_names_all,
-                                                &inst_prefix,
-                                                sub_mod.name(),
-                                            ),
-                                        );
+                                        elab.var_decl_types
+                                            .insert_shared(sig_name.clone(), dt_for_type);
+                                        if dyn_outer_fixed_tail {
+                                            let inner: Option<Vec<(i64, i64)>> =
+                                                effective_decl_dims[1..]
+                                                    .iter()
+                                                    .map(|d| {
+                                                        extract_array_range(
+                                                            std::slice::from_ref(d),
+                                                            &sub_merged_params,
+                                                        )
+                                                    })
+                                                    .collect();
+                                            if let Some(inner) = inner.filter(|sh| {
+                                                sh.iter()
+                                                    .all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                            }) {
+                                                if let Some(dd_inner) = declared_unpacked_dims(
+                                                    &effective_decl_dims[1..],
+                                                    &sub_merged_params,
+                                                ) {
+                                                    let mut all = vec![(0i64, -1i64)];
+                                                    all.extend(dd_inner);
+                                                    elab.unpacked_decl_dims
+                                                        .insert(sig_name.clone(), all);
+                                                }
+                                                if inner.len() == 1 {
+                                                    elab.arrays_2d.insert(
+                                                        sig_name.clone(),
+                                                        ((0, -1), inner[0], width),
+                                                    );
+                                                } else {
+                                                    let mut shape = vec![(0i64, -1i64)];
+                                                    shape.extend(inner.iter().copied());
+                                                    elab.arrays_nd
+                                                        .insert(sig_name.clone(), (shape, width));
+                                                }
+                                                if let Some(init_expr) = &decl.init {
+                                                    deferred_decl_inits.push((
+                                                        sig_name.clone(),
+                                                        init_expr.as_ref().clone(),
+                                                    ));
+                                                }
+                                                continue;
+                                            }
+                                        }
                                     }
                                     Some(UnpackedDimension::Associative {
                                         data_type: kdt, ..
@@ -4578,6 +4683,11 @@ pub(super) fn inline_instantiation_items(
                                             )
                                         });
                                         elab.associative_arrays.insert(sig_name.clone(), is_str);
+                                        register_assoc_key_kind_meta(
+                                            elab,
+                                            &sig_name,
+                                            kdt.as_deref(),
+                                        );
                                         // §10.7: the element width, under the SCOPED name — the runtime
                                         // looks it up by resolved signal name, and a bare leaf would
                                         // collide with a same-named array in another module.
@@ -4691,18 +4801,76 @@ pub(super) fn inline_instantiation_items(
                                                     })),
                                                     _ => None,
                                                 };
-                                                let assoc_key_info = match qd {
+                                                let (assoc_kdt, assoc_key_info) = match qd {
                                                     UnpackedDimension::Associative {
                                                         data_type,
                                                         ..
-                                                    } => assoc_key_type_info(
+                                                    } => (
                                                         data_type.as_deref(),
-                                                        &sub_merged_params,
-                                                        &elab.typedefs,
-                                                        &elab.typedef_types,
+                                                        assoc_key_type_info(
+                                                            data_type.as_deref(),
+                                                            &sub_merged_params,
+                                                            &elab.typedefs,
+                                                            &elab.typedef_types,
+                                                        ),
                                                     ),
-                                                    _ => (None, None),
+                                                    _ => (None, (None, None)),
                                                 };
+                                                let is_queue = matches!(
+                                                    qd,
+                                                    UnpackedDimension::Queue { .. }
+                                                );
+                                                let tail = &effective_decl_dims[split + 1..];
+                                                let tail_shape: Option<Vec<(i64, i64)>> =
+                                                    (!tail.is_empty()
+                                                        && assoc_key.is_none()
+                                                        && tail.iter().all(|d| {
+                                                            matches!(
+                                                                d,
+                                                                UnpackedDimension::Range { .. }
+                                                                    | UnpackedDimension::Expression { .. }
+                                                            )
+                                                        }))
+                                                    .then(|| {
+                                                        tail.iter()
+                                                            .map(|d| {
+                                                                extract_array_range(
+                                                                    std::slice::from_ref(d),
+                                                                    &sub_merged_params,
+                                                                )
+                                                            })
+                                                            .collect::<Option<Vec<_>>>()
+                                                    })
+                                                    .flatten()
+                                                    .filter(|sh| {
+                                                        sh.iter().all(|&(lo, hi)| {
+                                                            hi >= lo && hi - lo < 4096
+                                                        })
+                                                    });
+                                                let tail_decl = tail_shape.as_ref().and_then(|_| {
+                                                    declared_unpacked_dims(
+                                                        tail,
+                                                        &sub_merged_params,
+                                                    )
+                                                });
+                                                let shared_dt = instance_decl_type(
+                                                    &mut cache.decl_types,
+                                                    &dd.data_type,
+                                                    &sub_typedef_names_all,
+                                                    &inst_prefix,
+                                                    sub_mod.name(),
+                                                );
+                                                let is_two_state = is_type_two_state_resolved(
+                                                    &shared_dt,
+                                                    &elab.typedef_types,
+                                                ) || is_type_two_state_resolved(
+                                                    &dd.data_type,
+                                                    &elab.typedef_types,
+                                                );
+                                                if is_two_state {
+                                                    elab.two_state_signals
+                                                        .insert(sig_name.clone());
+                                                }
                                                 for suffix in index_tuples(&shape) {
                                                     let en = format!("{}{}", sig_name, suffix);
                                                     if let Some(is_str) = assoc_key {
@@ -4711,28 +4879,63 @@ pub(super) fn inline_instantiation_items(
                                                         register_assoc_element_key_type(
                                                             elab,
                                                             en,
+                                                            assoc_kdt,
                                                             is_str,
                                                             width,
                                                             &assoc_key_info,
                                                         );
                                                         continue;
                                                     }
+                                                    if is_two_state {
+                                                        elab.two_state_signals.insert(en.clone());
+                                                    }
                                                     elab.dynamic_arrays.insert(en.clone());
+                                                    if is_queue {
+                                                        elab.queue_vars.insert(en.clone());
+                                                    }
                                                     if let Some(m) = qmax {
                                                         elab.queue_max_sizes.insert(en.clone(), m);
                                                     }
-                                                    elab.arrays.insert(en, (0, 63, width));
+                                                    if let Some(inner) = &tail_shape {
+                                                        if let Some(td) = &tail_decl {
+                                                            let mut all = vec![(0i64, -1i64)];
+                                                            all.extend(td.iter().copied());
+                                                            elab.unpacked_decl_dims
+                                                                .insert(en.clone(), all);
+                                                        }
+                                                        if inner.len() == 1 {
+                                                            elab.arrays_2d.insert(
+                                                                en.clone(),
+                                                                ((0, -1), inner[0], width),
+                                                            );
+                                                        } else {
+                                                            let mut full = vec![(0i64, -1i64)];
+                                                            full.extend(inner.iter().copied());
+                                                            elab.arrays_nd
+                                                                .insert(en.clone(), (full, width));
+                                                        }
+                                                        elab.var_decl_types.insert_shared(
+                                                            en.clone(),
+                                                            std::rc::Rc::clone(&shared_dt),
+                                                        );
+                                                        if let DataType::TypeReference {
+                                                            name: tn,
+                                                            ..
+                                                        } = &dd.data_type
+                                                        {
+                                                            elab.array_elem_class
+                                                                .insert(en, tn.name.name.clone());
+                                                        }
+                                                    } else {
+                                                        elab.var_decl_types.insert_shared(
+                                                            en.clone(),
+                                                            std::rc::Rc::clone(&shared_dt),
+                                                        );
+                                                        elab.arrays.insert(en, (0, -1, width));
+                                                    }
                                                 }
-                                                elab.var_decl_types.insert_shared(
-                                                    sig_name.clone(),
-                                                    instance_decl_type(
-                                                        &mut cache.decl_types,
-                                                        &dd.data_type,
-                                                        &sub_typedef_names_all,
-                                                        &inst_prefix,
-                                                        sub_mod.name(),
-                                                    ),
-                                                );
+                                                elab.var_decl_types
+                                                    .insert_shared(sig_name.clone(), shared_dt);
                                                 continue;
                                             }
                                         }
@@ -4759,12 +4962,26 @@ pub(super) fn inline_instantiation_items(
                                     )
                                     .filter(|sh| sh.len() > 1)
                                     {
+                                        let dt_for_type = instance_decl_type(
+                                            &mut cache.decl_types,
+                                            &dd.data_type,
+                                            &sub_typedef_names_all,
+                                            &inst_prefix,
+                                            sub_mod.name(),
+                                        );
+                                        let two_state = is_type_two_state_resolved(
+                                            &dt_for_type,
+                                            &elab.typedef_types,
+                                        ) || is_type_two_state_resolved(
+                                            &dd.data_type,
+                                            &elab.typedef_types,
+                                        );
                                         register_fixed_unpacked_array(
                                             elab,
                                             &sig_name,
                                             &shape,
                                             width,
-                                            is_type_two_state(&dd.data_type),
+                                            two_state,
                                         );
                                         // Same §7.6 order as the 1-D instance path.
                                         // `register_fixed_unpacked_array` records the
@@ -4781,16 +4998,8 @@ pub(super) fn inline_instantiation_items(
                                             elab.unpacked_decl_dims
                                                 .insert(sig_name.clone(), declared);
                                         }
-                                        elab.var_decl_types.insert_shared(
-                                            sig_name.clone(),
-                                            instance_decl_type(
-                                                &mut cache.decl_types,
-                                                &dd.data_type,
-                                                &sub_typedef_names_all,
-                                                &inst_prefix,
-                                                sub_mod.name(),
-                                            ),
-                                        );
+                                        elab.var_decl_types
+                                            .insert_shared(sig_name.clone(), dt_for_type);
                                         // §6.8: its initializer is deferred like every
                                         // other instance declaration's (one whole-pattern
                                         // assignment, rewritten into the instance scope).

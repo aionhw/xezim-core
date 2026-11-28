@@ -209,6 +209,8 @@ impl Serialize for ElaboratedModule {
             associative_arrays,
             assoc_elem_widths,
             assoc_index_widths,
+            wildcard_assoc_arrays,
+            assoc_key_struct_types,
             classes,
             covergroups,
             functions,
@@ -321,7 +323,7 @@ impl Serialize for ElaboratedModule {
             source_line_maps: _,
         } = self;
 
-        let mut st = serializer.serialize_struct("ElaboratedModule", 120)?;
+        let mut st = serializer.serialize_struct("ElaboratedModule", 122)?;
         st.serialize_field("name", name)?;
         st.serialize_field("default_net_type", default_net_type)?;
         st.serialize_field("default_net_types", default_net_types)?;
@@ -370,6 +372,8 @@ impl Serialize for ElaboratedModule {
         st.serialize_field("associative_arrays", associative_arrays)?;
         st.serialize_field("assoc_elem_widths", assoc_elem_widths)?;
         st.serialize_field("assoc_index_widths", assoc_index_widths)?;
+        st.serialize_field("wildcard_assoc_arrays", wildcard_assoc_arrays)?;
+        st.serialize_field("assoc_key_struct_types", assoc_key_struct_types)?;
         st.serialize_field("classes", classes)?;
         st.serialize_field("covergroups", covergroups)?;
         if deferred_function_bodies.is_empty() {

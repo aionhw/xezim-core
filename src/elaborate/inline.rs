@@ -642,26 +642,32 @@ fn inline_instantiations_inner(
                                     }
                                 }
                                 if is_assoc {
-                                    // The key type was hardcoded non-string here,
-                                    // unlike the module-scope path — a package-level
-                                    // `[string]` map indexed by a string key then
-                                    // hashed through the integer path.
-                                    let is_string_key = matches!(
-                                        first_dim,
-                                        Some(UnpackedDimension::Associative { data_type: Some(kdt), .. })
-                                            if matches!(
-                                                kdt.as_ref(),
-                                                DataType::Simple { kind: SimpleType::String, .. }
-                                            )
+                                    let key_dt = match first_dim {
+                                        Some(UnpackedDimension::Associative { data_type, .. }) => {
+                                            data_type.as_deref()
+                                        }
+                                        _ => None,
+                                    };
+                                    let is_string_key = key_dt.is_some_and(|kdt| {
+                                        matches!(
+                                            resolve_typedef_chain(kdt, &elab.typedef_types),
+                                            DataType::Simple { kind: SimpleType::String, .. }
+                                        )
+                                    });
+                                    let key_info = assoc_key_type_info(
+                                        key_dt,
+                                        &elab.parameters,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
                                     );
-                                    elab.associative_arrays
-                                        .insert(decl.name.name.clone(), is_string_key);
-                                    // Record the element DataType keyed by the
-                                    // base name so an inline `arr[k] = new` can
-                                    // resolve the element CLASS from its declared
-                                    // type (package-scoped `uvm_seed_map m[string]`
-                                    // then `m[k] = new()` stored an opaque handle
-                                    // that deref'd null in uvm_create_random_seed).
+                                    register_assoc_element_key_type(
+                                        elab,
+                                        decl.name.name.clone(),
+                                        key_dt,
+                                        is_string_key,
+                                        width,
+                                        &key_info,
+                                    );
                                     elab.var_decl_types
                                         .insert(decl.name.name.clone(), dd.data_type.clone());
                                     // §6.8/§7.9.11: `int aa[string] = '{"x": 11}` —
