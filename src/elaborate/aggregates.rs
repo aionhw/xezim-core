@@ -537,8 +537,13 @@ pub(super) fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &st
     // of its member names — writing `u.a` must be readable as `u.b`. So an
     // untagged union gets a single signal whose members all start at bit 0,
     // exactly like a packed one. (A TAGGED union is tag-checked: §7.3.2.)
-    if matches!(su.kind, StructUnionKind::Union) && !su.tagged {
+    if matches!(su.kind, StructUnionKind::Union) {
         let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
+        let val = if su.tagged {
+            Value::new(w)
+        } else {
+            default_value_for_type_resolved(dt, w, &elab.typedef_types)
+        };
         elab.signals.entry(base.to_string()).or_insert(Signal {
             is_const: false,
             name: base.to_string().into(),
@@ -546,11 +551,12 @@ pub(super) fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &st
             is_signed: false,
             is_real: false,
             direction: None,
-            value: Value::new(w).into(),
+            value: val.into(),
             type_name: None,
         });
-        if let Some(fields) =
-            flatten_struct_fields(dt, &elab.parameters, &elab.typedefs, &elab.typedef_types)
+        if !su.tagged
+            && let Some(fields) =
+                flatten_struct_fields(dt, &elab.parameters, &elab.typedefs, &elab.typedef_types)
         {
             if !fields.is_empty() {
                 elab.packed_struct_fields.insert(base.to_string(), fields);
@@ -775,11 +781,66 @@ pub(crate) fn packed_struct_field_layout_env(
 /// expansion, so `b_o.dw[0].value <= d` in a sub-module had no layout to land
 /// in and left the whole variable x, while the same code in the top module
 /// worked.
-pub(super) fn flatten_struct_fields(
+pub fn flatten_struct_fields(
     dt: &DataType,
     params: &dyn ParamLookup,
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<(String, u32, u32)>> {
+    flatten_struct_fields_mode(dt, params, typedefs, typedef_types, false)
+}
+
+/// Per-scope/per-instance memoization cache for `flatten_struct_fields` on bare
+/// named types (`DataType::TypeReference` without extra dimensions or type args).
+/// Invalidates automatically if `typedef_types`, `typedefs`, or `params` counts grow.
+#[derive(Default)]
+pub(super) struct FlattenStructCache {
+    generation: (usize, usize, usize),
+    map: HashMap<(String, bool), Option<Vec<(String, u32, u32)>>>,
+}
+
+impl FlattenStructCache {
+    pub(super) fn flatten_cached(
+        &mut self,
+        dt: &DataType,
+        params: &dyn ParamLookup,
+        params_len: usize,
+        typedefs: &HashMap<String, u32>,
+        typedef_types: &HashMap<String, DataType>,
+        env_tag: bool,
+    ) -> Option<Vec<(String, u32, u32)>> {
+        let cur_gen = (typedef_types.len(), typedefs.len(), params_len);
+        if self.generation != cur_gen {
+            self.map.clear();
+            self.generation = cur_gen;
+        }
+        if let DataType::TypeReference {
+            name,
+            dimensions,
+            type_args,
+            ..
+        } = dt
+            && dimensions.is_empty()
+            && type_args.is_empty()
+        {
+            let key = (name.qualified(), env_tag);
+            if let Some(cached) = self.map.get(&key) {
+                return cached.clone();
+            }
+            let res = flatten_struct_fields(dt, params, typedefs, typedef_types);
+            self.map.insert(key, res.clone());
+            return res;
+        }
+        flatten_struct_fields(dt, params, typedefs, typedef_types)
+    }
+}
+
+fn flatten_struct_fields_mode(
+    dt: &DataType,
+    params: &dyn ParamLookup,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+    lsb_first_unpacked: bool,
 ) -> Option<Vec<(String, u32, u32)>> {
     // A NESTED member typed by ANOTHER package's scoped typedef
     // (`q::inner_t` inside p's struct) needs q's params bare for ITS member
@@ -829,6 +890,9 @@ pub(super) fn flatten_struct_fields(
     let resolved = resolve_typedef_chain(dt, typedef_types);
     if let DataType::Struct(su) = resolved {
         let is_union = matches!(su.kind, StructUnionKind::Union);
+        if is_union && su.tagged {
+            return None;
+        }
         let mut raw: Vec<(String, u32, DataType)> = Vec::new();
         for member in &su.members {
             let mw = resolve_type_width_env(&member.data_type, Some(&params), Some(typedefs));
@@ -919,17 +983,52 @@ pub(super) fn flatten_struct_fields(
             false
         };
         let mut out: Vec<(String, u32, u32)> = Vec::new();
+        let next_lsb_first = if is_union {
+            !su.packed && !su.soft && !su.tagged
+        } else {
+            lsb_first_unpacked && !su.packed && !su.soft
+        };
         if is_union {
             for (mn, mw, mdt) in &raw {
                 out.push((mn.clone(), 0, *mw));
                 if expand_member(mn, *mw, mdt, 0, &mut out) {
                     continue;
                 }
-                if let Some(subs) = flatten_struct_fields(mdt, params, typedefs, typedef_types) {
+                if let Some(subs) = flatten_struct_fields_mode(
+                    mdt,
+                    params,
+                    typedefs,
+                    typedef_types,
+                    next_lsb_first,
+                ) {
                     for (sn, so, sw) in subs {
                         out.push((format!("{}.{}", mn, sn), so, sw));
                     }
                 }
+            }
+        } else if !su.packed && !su.soft && lsb_first_unpacked {
+            // §7.3 common initial sequence: unpacked structs inside an
+            // unpacked untagged union lay out their members from bit 0 upward
+            // in declaration order so shared initial prefixes alias identically.
+            let mut offset: u32 = 0;
+            for (mn, mw, mdt) in &raw {
+                out.push((mn.clone(), offset, *mw));
+                if expand_member(mn, *mw, mdt, offset, &mut out) {
+                    offset += mw;
+                    continue;
+                }
+                if let Some(subs) = flatten_struct_fields_mode(
+                    mdt,
+                    params,
+                    typedefs,
+                    typedef_types,
+                    next_lsb_first,
+                ) {
+                    for (sn, so, sw) in subs {
+                        out.push((format!("{}.{}", mn, sn), offset + so, sw));
+                    }
+                }
+                offset += mw;
             }
         } else {
             let mut offset: u32 = 0;
@@ -939,7 +1038,13 @@ pub(super) fn flatten_struct_fields(
                     offset += mw;
                     continue;
                 }
-                if let Some(subs) = flatten_struct_fields(mdt, params, typedefs, typedef_types) {
+                if let Some(subs) = flatten_struct_fields_mode(
+                    mdt,
+                    params,
+                    typedefs,
+                    typedef_types,
+                    next_lsb_first,
+                ) {
                     for (sn, so, sw) in subs {
                         out.push((format!("{}.{}", mn, sn), offset + so, sw));
                     }

@@ -205,9 +205,12 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
                 is_signed: signed,
                 is_real: false,
                 direction: None,
-                value: Value::new(w).into(),
+                value: default_value_for_type_resolved(dt, w, &elab.typedef_types).into(),
                 type_name: None,
             });
+            if is_type_two_state_resolved(dt, &elab.typedef_types) {
+                elab.two_state_signals.insert(name.to_string());
+            }
             if let Some(fields) =
                 flatten_struct_fields(dt, &elab.parameters, &elab.typedefs, &elab.typedef_types)
             {
@@ -226,6 +229,9 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
             register_unpacked_aggregate(elab, name, dt);
         }
         _ => {
+            if !real && is_type_two_state_resolved(dt, &elab.typedef_types) {
+                elab.two_state_signals.insert(name.to_string());
+            }
             elab.signals.entry(name.to_string()).or_insert(Signal {
                 is_const: false,
                 name: name.to_string().into(),
@@ -233,19 +239,7 @@ pub(super) fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: 
                 is_signed: signed,
                 is_real: real,
                 direction: None,
-                value: if real {
-                    Value::from_f64(0.0).into()
-                } else if matches!(
-                    &resolved,
-                    DataType::Simple {
-                        kind: SimpleType::Chandle,
-                        ..
-                    }
-                ) {
-                    Value::zero(w).into()
-                } else {
-                    Value::new(w).into()
-                },
+                value: default_value_for_type_resolved(dt, w, &elab.typedef_types).into(),
                 type_name: if shortreal {
                     Some("shortreal".into())
                 } else {

@@ -173,11 +173,9 @@ impl<'a> Parser<'a> {
         use crate::ast::stmt::Pattern;
         if self.eat(TokenKind::KwTagged).is_some() {
             let tag = self.parse_identifier();
-            // Optional member sub-pattern.
-            let inner = if matches!(
-                self.current_kind(),
-                TokenKind::ApostropheLBrace | TokenKind::KwTagged | TokenKind::Dot
-            ) {
+            // Optional member sub-pattern (struct, nested tagged, binding, or
+            // constant expression like `tagged Num 42` / `tagged Val -5`).
+            let inner = if self.can_start_tagged_pattern() {
                 Some(Box::new(self.parse_pattern()))
             } else {
                 None
@@ -194,6 +192,13 @@ impl<'a> Parser<'a> {
                 self.pending_pattern_bindings.push(id.clone());
                 Pattern::Binding(id)
             }
+        } else if self.at(TokenKind::LParen) && self.lparen_starts_pattern() {
+            // §12.6: `( pattern )` — unwrap nested pattern parens when the
+            // parenthesized form is a pattern (`tagged ...`, `.x`, `.*`, `'{...}`).
+            self.bump();
+            let p = self.parse_pattern();
+            self.expect(TokenKind::RParen);
+            p
         } else if self.eat(TokenKind::ApostropheLBrace).is_some() {
             let mut members = Vec::new();
             loop {
@@ -1560,6 +1565,11 @@ impl<'a> Parser<'a> {
                         ExprKind::AssignmentPattern(items),
                         self.span_from(start),
                     )))
+                } else if !tag.name.is_empty() && self.can_start_tagged_expr() {
+                    // Parse unparenthesized payload operand (§11.9 Syntax 11-1)
+                    // while stopping before comparison/logical/`matches`/ternary
+                    // and delimiters like `:`, `,`, `;`, `)`, `&&&`.
+                    Some(Box::new(self.parse_expr_bp(26)))
                 } else {
                     None
                 };
@@ -3487,6 +3497,74 @@ impl<'a> Parser<'a> {
             ExprKind::SystemCall { name, .. } => name.starts_with("$sva_"),
             _ => false,
         }
+    }
+
+    fn can_start_tagged_expr(&self) -> bool {
+        match self.current_kind() {
+            TokenKind::IntegerLiteral
+            | TokenKind::RealLiteral
+            | TokenKind::TimeLiteral
+            | TokenKind::UnbasedUnsizedLiteral
+            | TokenKind::StringLiteral
+            | TokenKind::TripleStringLiteral
+            | TokenKind::Identifier
+            | TokenKind::EscapedIdentifier
+            | TokenKind::SystemIdentifier
+            | TokenKind::KwTagged
+            | TokenKind::LBrace
+            | TokenKind::LParen
+            | TokenKind::ApostropheLBrace
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::LogNot
+            | TokenKind::BitNot
+            | TokenKind::BitAnd
+            | TokenKind::BitOr
+            | TokenKind::BitXor
+            | TokenKind::BitNand
+            | TokenKind::BitNor
+            | TokenKind::BitXnor
+            | TokenKind::Increment
+            | TokenKind::Decrement
+            | TokenKind::KwNull
+            | TokenKind::KwThis
+            | TokenKind::KwSuper
+            | TokenKind::Dollar
+            | TokenKind::KwInt
+            | TokenKind::KwInteger
+            | TokenKind::KwBit
+            | TokenKind::KwLogic
+            | TokenKind::KwReg
+            | TokenKind::KwByte
+            | TokenKind::KwShortint
+            | TokenKind::KwLongint
+            | TokenKind::KwTime
+            | TokenKind::KwReal
+            | TokenKind::KwShortreal
+            | TokenKind::KwRealtime
+            | TokenKind::KwString
+            | TokenKind::KwSigned
+            | TokenKind::KwUnsigned => true,
+            _ => false,
+        }
+    }
+
+    fn can_start_tagged_pattern(&self) -> bool {
+        matches!(
+            self.current_kind(),
+            TokenKind::ApostropheLBrace | TokenKind::KwTagged | TokenKind::Dot
+        ) || self.can_start_tagged_expr()
+    }
+
+    fn lparen_starts_pattern(&self) -> bool {
+        let mut off = 1usize;
+        while self.peek_kind_n(off) == TokenKind::LParen {
+            off += 1;
+        }
+        matches!(
+            self.peek_kind_n(off),
+            TokenKind::KwTagged | TokenKind::Dot | TokenKind::ApostropheLBrace
+        )
     }
 
     fn infix_bp(&self, no_arrow: bool) -> Option<(BinaryOp, u8, u8)> {

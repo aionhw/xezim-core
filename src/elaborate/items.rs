@@ -126,6 +126,7 @@ pub(super) fn elaborate_items(
             }
             ModuleItem::NetDeclaration(nd) => {
                 check_net_data_type(nd, elab)?;
+                check_hard_packed_union_widths(&nd.data_type, elab, nd.span)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed_resolved(&nd.data_type, &elab.typedef_types);
@@ -185,6 +186,7 @@ pub(super) fn elaborate_items(
                 if dd.declarators.is_empty() {
                     continue;
                 }
+                check_hard_packed_union_widths(&dd.data_type, elab, dd.span)?;
                 register_anonymous_enum_members(&dd.data_type, elab);
                 // Packed multi-D (`logic [N-1:0][W-1:0] mem;`) — record the
                 // per-element width under the bare declarator name so
@@ -1155,6 +1157,9 @@ pub(super) fn elaborate_items(
             }
             ModuleItem::TypedefDeclaration(td) => {
                 process_typedef(td, elab);
+                if !td.forward {
+                    check_hard_packed_union_widths(&td.data_type, elab, td.span)?;
+                }
             }
             ModuleItem::AliasDecl(terms) => {
                 // §10.11: an alias statement in a generate block names ONE

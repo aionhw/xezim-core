@@ -208,6 +208,78 @@ pub fn resolve_type_width_env<P: ParamLookup>(
     params: Option<&P>,
     typedefs: Option<&HashMap<String, u32>>,
 ) -> u32 {
+    resolve_type_width_inner(dt, params, typedefs, None, None)
+}
+
+/// [`resolve_type_width_env`] with explicit typedef type and unpacked-dimension
+/// tables (for runtime queries after `TYPEDEF_SHAPES_TLS` is cleared).
+pub fn resolve_type_width_with_typedef_dims<P: ParamLookup>(
+    dt: &DataType,
+    params: Option<&P>,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: &HashMap<String, DataType>,
+    typedef_unpacked_dims: &HashMap<String, Vec<UnpackedDimension>>,
+) -> u32 {
+    resolve_type_width_inner(
+        dt,
+        params,
+        typedefs,
+        Some(typedef_types),
+        Some(typedef_unpacked_dims),
+    )
+}
+
+fn typedef_unpacked_elem_count<P: ParamLookup>(
+    dt: &DataType,
+    params: Option<&P>,
+    typedef_types: Option<&HashMap<String, DataType>>,
+    typedef_unpacked_dims: Option<&HashMap<String, Vec<UnpackedDimension>>>,
+) -> u32 {
+    let mut mul = 1u32;
+    let mut cur = dt.clone();
+    for _ in 0..64 {
+        let DataType::TypeReference {
+            name, dimensions, ..
+        } = &cur
+        else {
+            break;
+        };
+        if !dimensions.is_empty() {
+            break;
+        }
+        let (dim_n, next) = match (typedef_types, typedef_unpacked_dims) {
+            (Some(types), Some(dims_map)) => {
+                let d = lookup_scoped_type(name, dims_map)
+                    .map(|dims| unpacked_dims_elem_count(dims, params))
+                    .unwrap_or(1);
+                let n = lookup_scoped_type(name, types).cloned();
+                (d, n)
+            }
+            _ => TYPEDEF_SHAPES_TLS.with(|c| {
+                let c = c.borrow();
+                let d = lookup_scoped_type(name, &c.1)
+                    .map(|dims| unpacked_dims_elem_count(dims, params))
+                    .unwrap_or(1);
+                let n = lookup_scoped_type(name, &c.0).cloned();
+                (d, n)
+            }),
+        };
+        mul = mul.saturating_mul(dim_n);
+        match next {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    mul
+}
+
+fn resolve_type_width_inner<P: ParamLookup>(
+    dt: &DataType,
+    params: Option<&P>,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: Option<&HashMap<String, DataType>>,
+    typedef_unpacked_dims: Option<&HashMap<String, Vec<UnpackedDimension>>>,
+) -> u32 {
     match dt {
         DataType::IntegerVector { dimensions, .. } => {
             if dimensions.is_empty() {
@@ -341,7 +413,7 @@ pub fn resolve_type_width_env<P: ParamLookup>(
         },
         DataType::Enum(e) => {
             let base = if let Some(bt) = &e.base_type {
-                resolve_type_width_env(bt, params, typedefs)
+                resolve_type_width_inner(bt, params, typedefs, typedef_types, typedef_unpacked_dims)
             } else {
                 32
             };
@@ -366,15 +438,25 @@ pub fn resolve_type_width_env<P: ParamLookup>(
             let mut max_w = 0u32;
             let mut member_count = 0u32;
             for member in &s.members {
-                let mw = resolve_type_width_env(&member.data_type, params, typedefs);
+                let mw = resolve_type_width_inner(
+                    &member.data_type,
+                    params,
+                    typedefs,
+                    typedef_types,
+                    typedef_unpacked_dims,
+                );
+                let td_n = typedef_unpacked_elem_count(
+                    &member.data_type,
+                    params,
+                    typedef_types,
+                    typedef_unpacked_dims,
+                );
                 for mdecl in &member.declarators {
-                    // §7.4.2: an UNPACKED dimension on the member multiplies its
-                    // contribution — `logic [7:0] arr [3]` is 24 bits of the
-                    // struct, not 8. Counting one element made `$bits` of any
-                    // struct with an array member too small, and (worse) that
-                    // width sized the variable, so a return value was truncated
-                    // and the members laid out above the cut were lost.
-                    let n = unpacked_dims_elem_count(&mdecl.dimensions, params);
+                    // §7.4.2: an UNPACKED dimension on the member (or on its
+                    // typedef) multiplies its contribution — `logic [7:0] arr [3]`
+                    // or `a3_t a` is 24 bits of the struct, not 8.
+                    let n = unpacked_dims_elem_count(&mdecl.dimensions, params)
+                        .saturating_mul(td_n);
                     let dw = mw.saturating_mul(n);
                     total += dw;
                     if dw > max_w {
@@ -385,10 +467,11 @@ pub fn resolve_type_width_env<P: ParamLookup>(
             }
             let elem_w = if is_union {
                 if s.tagged {
-                    let tag_w = (member_count.max(2) - 1)
-                        .next_power_of_two()
-                        .trailing_zeros()
-                        .max(1);
+                    let tag_w = if member_count <= 1 {
+                        1
+                    } else {
+                        (member_count as u64 - 1).ilog2() + 1
+                    };
                     max_w + tag_w
                 } else {
                     max_w
@@ -417,6 +500,44 @@ pub fn resolve_type_width_env<P: ParamLookup>(
 }
 
 /// Check if a data type is signed.
+/// Compute `(tag_bits, max_member_bits, members)` for a tagged union in
+/// declaration order (void members have width 0).
+pub fn tagged_union_layout(
+    su: &StructUnionType,
+    params: Option<&HashMap<String, Value>>,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: Option<&HashMap<String, DataType>>,
+    typedef_unpacked_dims: Option<&HashMap<String, Vec<UnpackedDimension>>>,
+) -> (u32, u32, Vec<(String, u32, DataType)>) {
+    let mut members = Vec::new();
+    let mut max_w = 0u32;
+    for member in &su.members {
+        let mw = resolve_type_width_inner(
+            &member.data_type,
+            params,
+            typedefs,
+            typedef_types,
+            typedef_unpacked_dims,
+        );
+        let td_n =
+            typedef_unpacked_elem_count(&member.data_type, params, typedef_types, typedef_unpacked_dims);
+        for d in &member.declarators {
+            let n = unpacked_dims_elem_count(&d.dimensions, params).saturating_mul(td_n);
+            let dw = mw.saturating_mul(n);
+            if dw > max_w {
+                max_w = dw;
+            }
+            members.push((d.name.name.clone(), dw, member.data_type.clone()));
+        }
+    }
+    let tag_w = if members.len() <= 1 {
+        1
+    } else {
+        (members.len() as u64 - 1).ilog2() + 1
+    };
+    (tag_w, max_w, members)
+}
+
 pub fn is_type_signed(dt: &DataType) -> bool {
     match dt {
         DataType::IntegerVector { signing, .. } => matches!(signing, Some(Signing::Signed)),
@@ -435,13 +556,19 @@ pub fn is_type_signed(dt: &DataType) -> bool {
         }
         DataType::Implicit { signing, .. } => matches!(signing, Some(Signing::Signed)),
         DataType::Real { .. } => true,
-        DataType::Struct(su) => matches!(su.signing, Some(Signing::Signed)),
+        // §7.4.1: a packed array of a struct or enum is unsigned as a whole,
+        // even when its element type is declared `signed`.
+        DataType::Struct(su) => {
+            su.dimensions.is_empty() && matches!(su.signing, Some(Signing::Signed))
+        }
         // §6.19: an enum takes the signedness of its BASE type, and the
         // default base is `int` — which is signed. This arm was missing, so
         // every enum was unsigned: `enum shortint {A=-1,...} es;` read `es`
         // as 65534 instead of -2, `es.first()` as 65535 instead of -1, and
         // `es.first() < 0` was false (ivtest enum_method_signed1..4).
-        DataType::Enum(e) => e.base_type.as_deref().map(is_type_signed).unwrap_or(true),
+        DataType::Enum(e) => {
+            e.dimensions.is_empty() && e.base_type.as_deref().map(is_type_signed).unwrap_or(true)
+        }
         _ => false,
     }
 }
@@ -586,9 +713,16 @@ pub fn is_type_signed_resolved(dt: &DataType, typedef_types: &HashMap<String, Da
     // Malformed input must be diagnosed, never crash the tool.
     let mut cur = dt;
     for _ in 0..64 {
-        let DataType::TypeReference { name, .. } = cur else {
+        let DataType::TypeReference {
+            name, dimensions, ..
+        } = cur
+        else {
             break;
         };
+        // §7.4.1: a packed array of a named signed type is unsigned as a whole.
+        if !dimensions.is_empty() {
+            return false;
+        }
         let key = &name.name.name;
         // §26.3: scoped `P::T` prefers the qualified registration.
         let inner = lookup_scoped_type(name, typedef_types);
@@ -605,6 +739,9 @@ pub fn is_type_signed_resolved(dt: &DataType, typedef_types: &HashMap<String, Da
     // `is_type_signed` cannot resolve it without the table, so the enum read
     // unsigned and `e < 0` was false.
     if let DataType::Enum(e) = cur {
+        if !e.dimensions.is_empty() {
+            return false;
+        }
         return match e.base_type.as_deref() {
             Some(bt) => is_type_signed_resolved(bt, typedef_types),
             None => true, // default base is `int` — signed
@@ -733,12 +870,41 @@ pub(super) fn pkg_param_is_signed(
     }
 }
 
-pub(super) fn default_value_for_type_resolved(
+pub fn default_value_for_type_resolved(
     dt: &DataType,
     width: u32,
     typedef_types: &HashMap<String, DataType>,
 ) -> Value {
     let resolved = resolve_typedef_chain(dt, typedef_types);
+    // §7.3 / §7.3.1: an untagged union default-initializes from its FIRST
+    // member only (if that member is 4-state, the union starts all X even when
+    // later members are 2-state; if it is 2-state, those bits start 0).
+    if let DataType::Struct(su) = resolved
+        && matches!(su.kind, StructUnionKind::Union)
+        && !su.tagged
+    {
+        if su.packed && is_type_two_state_resolved(resolved, typedef_types) {
+            return Value::zero(width);
+        }
+        let mut out = Value::new(width);
+        if let Some(first_m) = su.members.first() {
+            let first_dt = resolve_typedef_chain(&first_m.data_type, typedef_types);
+            let fw = resolve_type_width_inner::<HashMap<String, Value>>(
+                first_dt,
+                None,
+                None,
+                Some(typedef_types),
+                None,
+            )
+            .min(width);
+            if fw > 0 {
+                let first_v =
+                    default_value_for_type_resolved(first_dt, fw, typedef_types);
+                out.copy_bits_from(0, &first_v, 0, fw as usize);
+            }
+        }
+        return out;
+    }
     // §6.8, §6.19.2: a packed struct or enum may reach a two-state
     // member or base through a typedef.
     if matches!(resolved, DataType::Struct(_) | DataType::Enum(_))

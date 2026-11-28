@@ -2712,6 +2712,7 @@ pub(super) fn inline_instantiation_items(
                         &fields,
                     );
                 }
+                let mut inst_flat_cache = FlattenStructCache::default();
 
                 // Bind NON-overridden `parameter type` DEFAULTS as scoped
                 // typedefs, resolving their width against the sub-instance's
@@ -2853,11 +2854,13 @@ pub(super) fn inline_instantiation_items(
                                 let fields = if member_wise {
                                     None
                                 } else {
-                                    flatten_struct_fields(
+                                    inst_flat_cache.flatten_cached(
                                         dt,
                                         &sub_merged_params,
+                                        sub_merged_params.len(),
                                         &elab.typedefs,
                                         &elab.typedef_types,
+                                        false,
                                     )
                                 };
                                 if let Some(fields) = fields {
@@ -3181,6 +3184,14 @@ pub(super) fn inline_instantiation_items(
                 iprof_since("ck4_before_loopB", __th);
                 for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
+                        if !td.forward {
+                            check_hard_packed_union_widths_with_params(
+                                &td.data_type,
+                                &sub_merged_params,
+                                elab,
+                                td.span,
+                            )?;
+                        }
                         if let DataType::Enum(et) = &td.data_type {
                             let base_width = et
                                 .base_type
@@ -3857,20 +3868,37 @@ pub(super) fn inline_instantiation_items(
                                         sub_mod.name(),
                                     ),
                                 );
-                                if matches!(resolve_typedef_chain(&nd.data_type, &elab.typedef_types),
-                                    DataType::Struct(su) if su.packed)
-                                    && let Some(fields) = flatten_struct_fields(
-                                    &nd.data_type, &sub_merged_params,
-                                    &elab.typedefs, &elab.typedef_types,
-                                ) {
-                                    if !fields.is_empty() {
-                                        let element_width = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-                                        if element_width > 0 && width > element_width && width % element_width == 0 {
-                                            elab.packed_signal_elem_widths.insert(sig_name.clone(), element_width);
-                                        }
-                                        tls_register_struct_layout(&sig_name, &fields);
-                                        elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                let is_packed_struct = matches!(
+                                    resolve_typedef_chain(&nd.data_type, &elab.typedef_types),
+                                    DataType::Struct(su) if su.packed
+                                );
+                                let packed_fields = if is_packed_struct {
+                                    inst_flat_cache.flatten_cached(
+                                        &nd.data_type,
+                                        &sub_merged_params,
+                                        sub_merged_params.len(),
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                        false,
+                                    )
+                                } else {
+                                    None
+                                };
+                                if let Some(ref fields) = packed_fields
+                                    && !fields.is_empty()
+                                {
+                                    let element_width =
+                                        fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                    if element_width > 0
+                                        && width > element_width
+                                        && width % element_width == 0
+                                    {
+                                        elab.packed_signal_elem_widths
+                                            .insert(sig_name.clone(), element_width);
                                     }
+                                    tls_register_struct_layout(&sig_name, fields);
+                                    elab.packed_struct_fields
+                                        .insert(sig_name.clone(), fields.clone());
                                 }
                                 let net_is_real =
                                     is_type_real_resolved(&nd.data_type, &elab.typedef_types);
@@ -3883,20 +3911,8 @@ pub(super) fn inline_instantiation_items(
                                 // §7.2.1, §6.7.1: a packed-struct NET's declared
                                 // type and field layout, as the top-level net
                                 // arm and this instance's variable and port arms
-                                // register them. Without the layout a member
-                                // read (`n.a`) did not resolve to the net's
-                                // bits, so a reader was never woken by the net
-                                // and kept a stale value; the same declaration
-                                // in the top module worked.
-                                if let DataType::Struct(su) =
-                                    resolve_typedef_chain(&nd.data_type, &elab.typedef_types)
-                                    && su.packed
-                                    && let Some(fields) = flatten_struct_fields(
-                                        &nd.data_type,
-                                        &sub_merged_params,
-                                        &elab.typedefs,
-                                        &elab.typedef_types,
-                                    )
+                                // register them.
+                                if let Some(fields) = packed_fields
                                     && !fields.is_empty()
                                 {
                                     elab.var_decl_types.insert(
