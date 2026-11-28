@@ -677,6 +677,24 @@ pub(super) fn inline_instantiation_items(
                     }
                 }
 
+                // §23.3.2: a port left out of the connection list is legal
+                // but usually a slip; warn once per (module, port).
+                if source_def.name() != crate::MULTI_TOP_WRAPPER {
+                    for name in omitted_ports(sub_mod.ports(), &hi.connections) {
+                        if sub_iface_ports.contains(name) || sub_interface_map.contains_key(name) {
+                            continue;
+                        }
+                        warn_omitted_port(
+                            sub_mod_name,
+                            name,
+                            &inst_prefix,
+                            hi.span,
+                            elab,
+                            source_def.name(),
+                        );
+                    }
+                }
+
                 // §23.2.2.4: an input port left unconnected (empty ordered
                 // slot `dut(,x)`, named `.i()`, or absent from a short
                 // connection list) that declares a default value is driven by
