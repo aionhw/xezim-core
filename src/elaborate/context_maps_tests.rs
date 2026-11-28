@@ -56,11 +56,13 @@ fn same_width_types_keep_different_query_bounds() {
         dims: vec![(7, 4)],
         unpacked: 0,
         whole: None,
+        is_string: false,
     };
     let ascending = TypeQueryDims {
         dims: vec![(0, 3)],
         unpacked: 0,
         whole: None,
+        is_string: false,
     };
     let a = pool.intern([("T".into(), descending.clone())].into_iter().collect());
     let b = pool.intern([("T".into(), ascending)].into_iter().collect());

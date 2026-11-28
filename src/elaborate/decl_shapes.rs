@@ -932,19 +932,27 @@ fn decl_shape_query<P: ParamLookup>(
         dims: fixed_unpacked_bounds(&shape.unpacked, params)?,
         unpacked: shape.unpacked.len(),
         whole: None,
+        is_string: false,
     };
     let (elem_w, inner) = typedefs_snapshot(|td| {
         let elem_w = resolve_type_width_env(&shape.data_type, params, td) as i64;
         let inner = TYPEDEF_SHAPES_TLS.with(|c| {
             let c = c.borrow();
             match &shape.data_type {
-                // A type parameter is known by the instance's width alone.
+                // A type parameter's instance-bound DataType is installed into
+                // TYPEDEF_SHAPES_TLS when elaborated; use it when present so
+                // multi-dimensional packed bounds resolve in const-eval, and
+                // fall back to width-only when no shape entry exists.
                 DataType::TypeReference {
                     name: tn,
                     dimensions,
                     ..
                 } if dimensions.is_empty() && shape.by_type_param => {
-                    type_query_dims_by_name(&tn.name.name, params, td, None, None)
+                    if c.0.contains_key(&tn.name.name) {
+                        type_query_dims_by_name(&tn.name.name, params, td, Some(&c.0), Some(&c.1))
+                    } else {
+                        type_query_dims_by_name(&tn.name.name, params, td, None, None)
+                    }
                 }
                 // A typedef'd element type contributes its own unpacked dimensions
                 // (`typedef int arr_t [3:0][1:5]; arr_t ta;`) and its packed shape.
@@ -966,6 +974,7 @@ fn decl_shape_query<P: ParamLookup>(
     q.dims.extend(inner.dims);
     q.unpacked += inner.unpacked;
     q.whole = inner.whole;
+    q.is_string = inner.is_string;
     // `real` is not a bit-stream type (§6.24.3), so an array of it has no
     // constant `$bits`; the reference simulator folds it to 0.
     let mut bits =
@@ -1036,6 +1045,45 @@ pub(super) fn decl_select_bits<P: ParamLookup>(e: &Expression, params: Option<&P
     (w > 0).then_some(w)
 }
 
+pub(super) fn unwrap_type_op_expr(mut e: &Expression) -> &Expression {
+    loop {
+        match &e.kind {
+            ExprKind::Paren(inner) => e = inner,
+            ExprKind::SystemCall { name, args }
+                if name == "$__xz_type_op" && args.len() == 1 =>
+            {
+                e = &args[0];
+            }
+            _ => return e,
+        }
+    }
+}
+
+/// §20.6.2 `$bits` and the §20.7 array queries over a declared variable of the
+/// scope being elaborated: `$bits(fx)`, `$size(fx2, 2)`, `$increment(pu)`.
+/// Outer `None`: operand is not such a declared variable; `Some(None)`: the
+/// variable is known but the queried dimension is out of range (`'x`);
+/// `Some(Some(v))`: folded integer result.
+pub(super) fn decl_var_query_dim<P: ParamLookup>(
+    fname: &str,
+    arg: &Expression,
+    dim: i64,
+    params: Option<&P>,
+) -> Option<Option<i64>> {
+    let arg = unwrap_type_op_expr(arg);
+    if !is_decl_shape_operand(arg) {
+        return None;
+    }
+    let (q, bits) = decl_shape_query(&decl_shape_operand_name(arg)?, params)?;
+    if fname == "$bits" {
+        return Some(bits);
+    }
+    if dim < 1 && !matches!(fname, "$dimensions" | "$unpacked_dimensions") {
+        return Some(None);
+    }
+    Some(type_query_bound(fname, &q, dim as usize))
+}
+
 /// §20.6.2 `$bits` and the §20.7 array queries over a declared variable of the
 /// scope being elaborated: `$bits(fx)`, `$size(fx2, 2)`, `$increment(pu)`.
 /// None when the operand is not such a variable (a parameter or a type keeps
@@ -1045,22 +1093,16 @@ pub(super) fn decl_var_query<P: ParamLookup>(
     args: &[Expression],
     params: Option<&P>,
 ) -> Option<i64> {
-    let arg = args.first()?;
-    if !is_decl_shape_operand(arg) {
-        return None;
-    }
-    let (q, bits) = decl_shape_query(&decl_shape_operand_name(arg)?, params)?;
-    if fname == "$bits" {
-        return bits;
-    }
-    let dim = match args.get(1) {
-        Some(d) => const_eval_i64_with_params_env(d, params)?,
-        None => 1,
+    let arg = unwrap_type_op_expr(args.first()?);
+    let dim = if matches!(fname, "$bits" | "$dimensions" | "$unpacked_dimensions") {
+        1
+    } else {
+        match args.get(1) {
+            Some(d) => const_eval_i64_with_params_env(d, params)?,
+            None => 1,
+        }
     };
-    if dim < 1 {
-        return None;
-    }
-    type_query_bound(fname, &q, dim as usize)
+    decl_var_query_dim(fname, arg, dim, params).flatten()
 }
 
 /// §20.7 array query over an explicit type operand (`$size(logic [7:0])`,
@@ -1118,6 +1160,7 @@ pub(super) fn decl_has_unpacked_dims(arg: &Expression) -> bool {
 /// Is `arg` a declared variable of the scope being elaborated whose shape the
 /// array queries can answer at elaboration time?
 pub(super) fn is_decl_shape_operand(arg: &Expression) -> bool {
+    let arg = unwrap_type_op_expr(arg);
     match &arg.kind {
         ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
             let Some(shape) = decl_shape_operand_name(arg).and_then(|n| decl_shape_of(&n)) else {

@@ -1501,38 +1501,54 @@ impl<'a> Parser<'a> {
                 Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
             }
 
-            // IEEE 1800-2017 §6.23: the type operator `type(<type_or_expr>)` as
-            // an expression — used in type comparisons (`type(T) == type(U)`)
-            // and `case (type(T)) … type(logic[11:0]) : …`. Parse-accept: we
-            // consume `type` + the balanced parenthesised operand and yield a
-            // placeholder constant (type identity isn't modelled at runtime, so
-            // comparisons fold to a constant — enough to elaborate).
+            // IEEE 1800-2023 §6.23 / §20.7: the type operator
+            // `type(<type_or_expr>)`. Speculatively parse the operand so
+            // `$size(type(a05))` and `$left(type(logic [3:0]))` retain their
+            // type/expr argument inside `$__xz_type_op(...)`. Exotic forms that
+            // fail to close on `RParen` rewind and fall back to the balanced
+            // paren skip producing `1'b0`.
             TokenKind::KwType if self.peek_kind() == TokenKind::LParen => {
                 self.bump(); // type
                 self.expect(TokenKind::LParen);
-                let mut depth = 1i32;
-                while depth > 0 && !self.at(TokenKind::Eof) {
-                    match self.current_kind() {
-                        TokenKind::LParen => depth += 1,
-                        TokenKind::RParen => depth -= 1,
-                        _ => {}
-                    }
-                    if depth == 0 {
-                        break;
-                    }
+                let save_pos = self.pos;
+                let save_diags = self.diagnostics.len();
+                let inner = self.parse_expression();
+                if self.at(TokenKind::RParen) && self.diagnostics.len() == save_diags {
                     self.bump();
+                    Expression::new(
+                        ExprKind::SystemCall {
+                            name: "$__xz_type_op".to_string(),
+                            args: vec![inner],
+                        },
+                        self.span_from(start),
+                    )
+                } else {
+                    self.pos = save_pos;
+                    self.diagnostics.truncate(save_diags);
+                    let mut depth = 1i32;
+                    while depth > 0 && !self.at(TokenKind::Eof) {
+                        match self.current_kind() {
+                            TokenKind::LParen => depth += 1,
+                            TokenKind::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        if depth == 0 {
+                            break;
+                        }
+                        self.bump();
+                    }
+                    self.expect(TokenKind::RParen);
+                    Expression::new(
+                        ExprKind::Number(NumberLiteral::Integer {
+                            size: Some(1),
+                            signed: false,
+                            base: NumberBase::Binary,
+                            value: "0".to_string(),
+                            cached_val: crate::ast::cache::LiteralCache::new(Some((0u64, 0u64, 1u32))),
+                        }),
+                        self.span_from(start),
+                    )
                 }
-                self.expect(TokenKind::RParen);
-                Expression::new(
-                    ExprKind::Number(NumberLiteral::Integer {
-                        size: Some(1),
-                        signed: false,
-                        base: NumberBase::Binary,
-                        value: "0".to_string(),
-                        cached_val: crate::ast::cache::LiteralCache::new(Some((0u64, 0u64, 1u32))),
-                    }),
-                    self.span_from(start),
-                )
             }
 
             // Concatenation / replication: { ... }

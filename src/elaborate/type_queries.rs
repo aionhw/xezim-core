@@ -18,6 +18,10 @@ pub struct TypeQueryDims {
     /// while `$dimensions` stays 0. `None` for a scalar `logic`/`bit` and for
     /// the non-integral types, which have no dimension at all and answer `x`.
     pub whole: Option<(i64, i64)>,
+    /// True for `string` (§20.7: `$dimensions(string)` is 1,
+    /// `$unpacked_dimensions(string)` is 0, and bound queries have no static
+    /// dimension in type position).
+    pub is_string: bool,
 }
 
 /// Is `name` a built-in data-type keyword? Such a word can never also name a
@@ -275,7 +279,7 @@ pub fn type_query_dims_of<P: ParamLookup>(
                 q.dims.push((w as i64 - 1, 0));
                 break;
             }
-            DataType::Enum(_) | DataType::Struct(_) => {
+            DataType::Enum(_) => {
                 // Neither an enum nor a packed struct/union has an array
                 // dimension of its own, so `$dimensions` is 0 — but the bound
                 // queries still describe its whole packed extent.
@@ -285,7 +289,26 @@ pub fn type_query_dims_of<P: ParamLookup>(
                 }
                 break;
             }
-            // real / string / chandle / event: no dimension to report.
+            DataType::Struct(ref su) => {
+                // Unpacked structs/unions have no dimensions and return 'x
+                // for bound queries (§20.7); packed structs/unions report
+                // whole `[w-1:0]` for bound queries while `$dimensions` stays 0.
+                if su.packed {
+                    let w = resolve_type_width_env(&t, params, typedefs);
+                    if w > 0 {
+                        q.whole = Some((w as i64 - 1, 0));
+                    }
+                }
+                break;
+            }
+            DataType::Simple {
+                kind: SimpleType::String,
+                ..
+            } => {
+                q.is_string = true;
+                break;
+            }
+            // real / chandle / event: no dimension to report.
             _ => break,
         }
     }
@@ -312,6 +335,15 @@ pub fn type_query_dims_by_name<P: ParamLookup>(
             dims: vec![(w as i64 - 1, 0)],
             unpacked: 0,
             whole: None,
+            is_string: false,
+        });
+    }
+    if name == "string" {
+        return Some(TypeQueryDims {
+            dims: Vec::new(),
+            unpacked: 0,
+            whole: None,
+            is_string: true,
         });
     }
     // A scalar `bit`/`logic`/`reg` has no packed dimension, and the
@@ -356,6 +388,7 @@ pub fn type_query_dims_by_name<P: ParamLookup>(
             let inner = type_query_dims_of(dt, params, typedefs, typedef_types);
             q.dims.extend(inner.dims);
             q.whole = inner.whole;
+            q.is_string = inner.is_string;
         }
         // Known only by width (an enum typedef): its extent answers the bound
         // queries, and it contributes no dimension.
@@ -373,9 +406,12 @@ pub fn type_query_dims_by_name<P: ParamLookup>(
 /// answers with `x`.
 pub fn type_query_bound(sn: &str, q: &TypeQueryDims, dim: usize) -> Option<i64> {
     match sn {
-        "$dimensions" => return Some(q.dims.len() as i64),
+        "$dimensions" => return Some((q.dims.len() + usize::from(q.is_string)) as i64),
         "$unpacked_dimensions" => return Some(q.unpacked as i64),
         _ => {}
+    }
+    if dim == 0 {
+        return None;
     }
     let (l, r) = match q.dims.get(dim.wrapping_sub(1)) {
         Some(&d) => d,
