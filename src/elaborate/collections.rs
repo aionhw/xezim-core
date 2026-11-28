@@ -18,11 +18,27 @@ pub fn coll_elem_split(dims: &[UnpackedDimension]) -> Option<usize> {
     if dims.len() < 2 {
         return None;
     }
+    let is_fixed = |d: &UnpackedDimension| {
+        matches!(
+            d,
+            UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }
+        )
+    };
     if let Some(k) = dims
         .iter()
         .position(|d| matches!(d, UnpackedDimension::Associative { .. }))
         && k >= 1
         && k + 1 < dims.len()
+    {
+        return Some(k);
+    }
+    if let Some(k) = dims.iter().position(|d| {
+        matches!(
+            d,
+            UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }
+        )
+    }) && k >= 1
+        && dims[k + 1..].iter().all(is_fixed)
     {
         return Some(k);
     }

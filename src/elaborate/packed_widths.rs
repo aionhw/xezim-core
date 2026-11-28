@@ -65,15 +65,37 @@ fn quiet_packed_width_probe(
     }
 }
 
-/// Serialize every definition's AST for the byte-level reference probe. A
-/// genuine reference to a name — expression ident, hierarchical segment,
-/// port connection, even a DPI/`uvm_hdl` path STRING — necessarily carries
-/// the name's exact bytes in this stream, so an occurrence count of ONE
-/// (the declarator itself) proves the declaration dead. Substring
-/// collisions only inflate the count, which merely KEEPS a dead variable —
-/// the safe direction. Only runs for beyond-cap declarations, so ordinary
-/// designs never pay for it.
-fn design_ast_blob(all_defs: &HashMap<String, Definition>) -> Vec<u8> {
+// Serialize every definition's AST for the byte-level reference probe. A
+// genuine reference to a name — expression ident, hierarchical segment,
+// port connection, even a DPI/`uvm_hdl` path STRING — necessarily carries
+// the name's exact bytes in this stream, so an occurrence count of ONE
+// (the declarator itself) proves the declaration dead. Substring
+// collisions only inflate the count, which merely KEEPS a dead variable —
+// the safe direction. Only runs for beyond-cap declarations, so ordinary
+// designs never pay for it.
+thread_local! {
+    // Cached serialized AST blob for `filter_dead_giant_declarators`, scoped to
+    // a single `elaborate_module_with_defs` invocation via `DesignAstBlobGuard`.
+    static DESIGN_AST_BLOB_CACHE: std::cell::RefCell<Option<(usize, usize, Vec<u8>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) struct DesignAstBlobGuard;
+
+impl DesignAstBlobGuard {
+    pub(super) fn enter() -> Self {
+        DESIGN_AST_BLOB_CACHE.with(|c| *c.borrow_mut() = None);
+        Self
+    }
+}
+
+impl Drop for DesignAstBlobGuard {
+    fn drop(&mut self) {
+        DESIGN_AST_BLOB_CACHE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+fn design_ast_blob_into(all_defs: &HashMap<String, Definition>) -> Vec<u8> {
     let mut blob: Vec<u8> = Vec::new();
     for def in all_defs.values() {
         let cfg = crate::xez_bincode_config();
@@ -92,6 +114,20 @@ fn design_ast_blob(all_defs: &HashMap<String, Definition>) -> Vec<u8> {
         }
     }
     blob
+}
+
+fn with_design_ast_blob<R>(all_defs: &HashMap<String, Definition>, f: impl FnOnce(&[u8]) -> R) -> R {
+    let key = (all_defs as *const HashMap<String, Definition> as usize, all_defs.len());
+    DESIGN_AST_BLOB_CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let needs_build = !matches!(&*slot, Some((ptr, len, _)) if (*ptr, *len) == key);
+        if needs_build {
+            let blob = design_ast_blob_into(all_defs);
+            *slot = Some((key.0, key.1, blob));
+        }
+        let (_, _, ref blob) = *slot.as_ref().unwrap();
+        f(blob)
+    })
 }
 
 fn count_byte_occurrences(blob: &[u8], needle: &[u8]) -> usize {
@@ -138,19 +174,20 @@ pub(super) fn filter_dead_giant_declarators(
     if candidates.is_empty() {
         return None;
     }
-    let blob = design_ast_blob(defs);
     let mut elide: Vec<usize> = Vec::new();
-    for &i in &candidates {
-        let name = &dd.declarators[i].name.name;
-        if count_byte_occurrences(&blob, name.as_bytes()) == 1 {
-            crate::elab_diag(format!(
-                "[xezim][note] eliding dead {}-bit declaration '{}' (referenced \
-                 nowhere in the design; commercial simulators drop it silently)",
-                w, name
-            ));
-            elide.push(i);
+    with_design_ast_blob(defs, |blob| {
+        for &i in &candidates {
+            let name = &dd.declarators[i].name.name;
+            if count_byte_occurrences(blob, name.as_bytes()) == 1 {
+                crate::elab_diag(format!(
+                    "[xezim][note] eliding dead {}-bit declaration '{}' (referenced \
+                     nowhere in the design; commercial simulators drop it silently)",
+                    w, name
+                ));
+                elide.push(i);
+            }
         }
-    }
+    });
     if elide.is_empty() {
         return None;
     }

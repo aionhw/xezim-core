@@ -1607,6 +1607,69 @@ impl Value {
         }
     }
 
+    /// Build a 4-state value from little-endian value and x/z word slices.
+    pub fn from_val_xz_words(v: &[u64], x: &[u64], width: u32, signed: bool) -> Value {
+        if width <= 64 {
+            let mut val = Value::from_inline(
+                v.first().copied().unwrap_or(0),
+                x.first().copied().unwrap_or(0),
+                width,
+            );
+            val.is_signed = signed;
+            return val;
+        }
+        let n = WidePlanes::nwords(width);
+        let mut val: Vec<u64> = (0..n).map(|i| v.get(i).copied().unwrap_or(0)).collect();
+        let mut xz: Vec<u64> = (0..n).map(|i| x.get(i).copied().unwrap_or(0)).collect();
+        let r = width % 64;
+        if r != 0 {
+            let mask = (1u64 << r) - 1;
+            val[n - 1] &= mask;
+            xz[n - 1] &= mask;
+        }
+        Value {
+            storage: ValueStorage::Wide(Box::new(WidePlanes {
+                val,
+                xz,
+                nbits: width,
+            })),
+            width,
+            is_signed: signed,
+            is_real: false,
+            is_fill: false,
+        }
+    }
+
+    /// Extract little-endian value and x/z words from `self` into `out_val` and
+    /// `out_xz` (whose length must match `WidePlanes::nwords(self.width)`).
+    pub fn write_val_xz_words(&self, out_val: &mut [u64], out_xz: &mut [u64]) {
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if !out_val.is_empty() {
+                    out_val[0] = *val_bits;
+                    out_xz[0] = *xz_bits;
+                }
+                for w in out_val.iter_mut().skip(1) {
+                    *w = 0;
+                }
+                for w in out_xz.iter_mut().skip(1) {
+                    *w = 0;
+                }
+            }
+            ValueStorage::Wide(bits) => {
+                let n = out_val.len().min(bits.val.len());
+                out_val[..n].copy_from_slice(&bits.val[..n]);
+                out_xz[..n].copy_from_slice(&bits.xz[..n]);
+                for w in &mut out_val[n..] {
+                    *w = 0;
+                }
+                for w in &mut out_xz[n..] {
+                    *w = 0;
+                }
+            }
+        }
+    }
+
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,

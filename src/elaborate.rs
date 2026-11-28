@@ -3938,6 +3938,10 @@ impl ElaboratedModule {
         let pending = std::mem::take(&mut self.pending_cont_assign);
         for p in pending {
             let ca = p.materialize(&self.parameters);
+            if self.is_bulk_array_copy_candidate(&ca) {
+                f(ca);
+                continue;
+            }
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.

@@ -501,6 +501,183 @@ pub fn whole_array_row_assign_parts(
 }
 
 impl ElaboratedModule {
+    /// Whether a continuous assignment `driver` can be lowered directly to a
+    /// bulk array-copy entry (`CombItem::BulkArrayCopy`) without expanding
+    /// into per-element AST nodes.
+    pub fn is_bulk_array_copy_candidate(&self, driver: &ContinuousAssignment) -> bool {
+        if driver.delay() != 0 || driver.delay_exprs().is_some() {
+            return false;
+        }
+        let lhs = driver.lhs_expr();
+        let rhs = driver.rhs_expr();
+        let dotted = |h: &HierarchicalIdentifier| {
+            h.root.is_none()
+                && h.path.iter().all(|s| s.selects.is_empty())
+                && !h.path.is_empty()
+        };
+        let dotted_name = |h: &HierarchicalIdentifier| -> String {
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let is_plain_fixed = |n: &str| -> bool {
+            if self.dynamic_arrays.contains(n)
+                || self.queue_vars.contains(n)
+                || self.associative_arrays.contains_key(n)
+                || self.resolved_net_kinds.contains_key(n)
+            {
+                return false;
+            }
+            if let Some(dt) = self.var_decl_types.get(n) {
+                let r = resolve_typedef_chain(dt, &self.typedef_types);
+                if matches!(r, DataType::Struct(su) if !su.packed) {
+                    return false;
+                }
+            }
+            true
+        };
+        let fixed_dims_lens = |n: &str| -> Option<Vec<usize>> {
+            if let Some(&(lo, hi, _)) = self.arrays.get(n) {
+                if hi < lo {
+                    return None;
+                }
+                return Some(vec![(hi - lo + 1) as usize]);
+            }
+            if let Some(&((lo1, hi1), (lo2, hi2), _)) = self.arrays_2d.get(n) {
+                if hi1 < lo1 || hi2 < lo2 {
+                    return None;
+                }
+                return Some(vec![(hi1 - lo1 + 1) as usize, (hi2 - lo2 + 1) as usize]);
+            }
+            if let Some((shape, _)) = self.arrays_nd.get(n) {
+                if shape.iter().any(|&(lo, hi)| hi < lo) {
+                    return None;
+                }
+                return Some(shape.iter().map(|&(lo, hi)| (hi - lo + 1) as usize).collect());
+            }
+            None
+        };
+        // Case 1: whole-array `assign dst = src;` (1-D, 2-D, or N-D).
+        if let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind)
+            && dotted(lh)
+            && dotted(rh)
+        {
+            let ln = dotted_name(lh);
+            let rn = dotted_name(rh);
+            if is_plain_fixed(&ln)
+                && is_plain_fixed(&rn)
+                && let (Some(ld), Some(rd)) = (fixed_dims_lens(&ln), fixed_dims_lens(&rn))
+                && ld == rd
+                && !ld.is_empty()
+            {
+                return true;
+            }
+        }
+        // Case 2: constant 1-D slice `assign dst[a:b] = src[c:d];` (or whole 1-D side).
+        if matches!(lhs.kind, ExprKind::RangeSelect { .. })
+            || matches!(rhs.kind, ExprKind::RangeSelect { .. })
+        {
+            let side_const_len = |e: &Expression| -> Option<(String, usize)> {
+                match &e.kind {
+                    ExprKind::Ident(h) if dotted(h) => {
+                        let n = dotted_name(h);
+                        if !is_plain_fixed(&n) {
+                            return None;
+                        }
+                        let &(lo, hi, _) = self.arrays.get(&n)?;
+                        if hi < lo {
+                            return None;
+                        }
+                        Some((n, (hi - lo + 1) as usize))
+                    }
+                    ExprKind::RangeSelect {
+                        expr: base,
+                        kind,
+                        left,
+                        right,
+                    } => {
+                        let ExprKind::Ident(h) = &base.kind else {
+                            return None;
+                        };
+                        if !dotted(h) {
+                            return None;
+                        }
+                        let n = dotted_name(h);
+                        if !is_plain_fixed(&n) {
+                            return None;
+                        }
+                        let &(lo, hi, _) = self.arrays.get(&n)?;
+                        if hi < lo {
+                            return None;
+                        }
+                        if eval_const_expr_val(left, &self.parameters).has_xz()
+                            || eval_const_expr_val(right, &self.parameters).has_xz()
+                        {
+                            return None;
+                        }
+                        let lv = const_eval_i64_with_params(left, Some(&self.parameters))?;
+                        let rv = const_eval_i64_with_params(right, Some(&self.parameters))?;
+                        match kind {
+                            RangeKind::Constant => {
+                                if lv.min(rv) < lo || lv.max(rv) > hi {
+                                    return None;
+                                }
+                                Some((n, (lv.abs_diff(rv) + 1) as usize))
+                            }
+                            RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                                if rv <= 0 {
+                                    return None;
+                                }
+                                let (slo, shi) = if matches!(kind, RangeKind::IndexedUp) {
+                                    (lv, lv + rv - 1)
+                                } else {
+                                    (lv - rv + 1, lv)
+                                };
+                                if slo < lo || shi > hi {
+                                    return None;
+                                }
+                                Some((n, rv as usize))
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            if let (Some((_, ll)), Some((_, rl))) = (side_const_len(&lhs), side_const_len(&rhs))
+                && ll == rl
+                && ll > 0
+            {
+                return true;
+            }
+        }
+        // Case 3: constant row `assign dst = src[row];`.
+        if let (ExprKind::Ident(lh), ExprKind::Index { expr, index }) = (&lhs.kind, &rhs.kind)
+            && let ExprKind::Ident(rh) = &expr.kind
+            && let ([l], [r]) = (lh.path.as_slice(), rh.path.as_slice())
+            && l.selects.is_empty()
+            && r.selects.is_empty()
+        {
+            let (ln, rn) = (&l.name.name, &r.name.name);
+            if is_plain_fixed(ln)
+                && is_plain_fixed(rn)
+                && let (Some(&(llo, lhi, _)), Some(&((olo, ohi), (ilo, ihi), _))) =
+                    (self.arrays.get(ln), self.arrays_2d.get(rn))
+                && lhi >= llo
+                && ihi >= ilo
+                && (lhi - llo) == (ihi - ilo)
+                && !eval_const_expr_val(index, &self.parameters).has_xz()
+                && let Some(row) = const_eval_i64_with_params(index, Some(&self.parameters))
+                && row >= olo.min(ohi)
+                && row <= olo.max(ohi)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// §10.9.1: retain the declared packed element type when an inherited
     /// default reaches the leaves of a continuous unpacked-array driver.
     pub fn whole_array_driver_parts(
@@ -536,6 +713,114 @@ impl ElaboratedModule {
             Some(&self.descending_arrays),
             Some(decl_dims),
             Some(&self.parameters),
+        )
+        .or_else(|| self.nd_whole_array_assign_parts(lhs, rhs, delay, decl_dims))
+    }
+
+    /// §7.6 / §10.3: fallback element-wise expansion for 2-D/N-D whole-array
+    /// continuous assignments (`assign cm2 = cm1;`) when not lowered as a bulk
+    /// copy (e.g. delayed drivers or unpacked-struct elements).
+    fn nd_whole_array_assign_parts(
+        &self,
+        lhs: &Expression,
+        rhs: &Expression,
+        delay: u64,
+        decl_dims: &crate::shared_names::SharedSliceMap<(i64, i64)>,
+    ) -> Option<Vec<ContinuousAssignment>> {
+        let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
+            return None;
+        };
+        let dotted = |h: &HierarchicalIdentifier| {
+            h.root.is_none()
+                && h.path.iter().all(|s| s.selects.is_empty())
+                && !h.path.is_empty()
+                && Some(
+                    h.path
+                        .iter()
+                        .map(|s| s.name.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("."),
+                )
+                .is_some()
+        };
+        if !dotted(lh) || !dotted(rh) {
+            return None;
+        }
+        let name_of = |h: &HierarchicalIdentifier| -> String {
+            h.path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let ln = name_of(lh);
+        let rn = name_of(rh);
+        let dims_of = |n: &str| -> Option<Vec<(i64, i64)>> {
+            if let Some(d) = decl_dims.get(n) && d.len() >= 2 {
+                return Some(d.to_vec());
+            }
+            if let Some(&((l1, r1), (l2, r2), _)) = self.arrays_2d.get(n) {
+                return Some(vec![(l1, r1), (l2, r2)]);
+            }
+            self.arrays_nd.get(n).map(|(sh, _)| sh.clone())
+        };
+        let ld = dims_of(&ln)?;
+        let rd = dims_of(&rn)?;
+        if ld.len() != rd.len() || ld.len() < 2 {
+            return None;
+        }
+        let l_lens: Vec<i64> = ld.iter().map(|&(l, r)| (l - r).abs() + 1).collect();
+        let r_lens: Vec<i64> = rd.iter().map(|&(l, r)| (l - r).abs() + 1).collect();
+        if l_lens != r_lens {
+            return None;
+        }
+        let total: i64 = l_lens.iter().try_fold(1i64, |a, &n| a.checked_mul(n))?;
+        if total <= 0 || total > 4096 {
+            return None;
+        }
+        fn collect_tuples(dims: &[(i64, i64)], prefix: &mut Vec<i64>, out: &mut Vec<Vec<i64>>) {
+            let Some(&(l, r)) = dims.first() else {
+                out.push(prefix.clone());
+                return;
+            };
+            if l <= r {
+                for i in l..=r {
+                    prefix.push(i);
+                    collect_tuples(&dims[1..], prefix, out);
+                    prefix.pop();
+                }
+            } else {
+                for i in (r..=l).rev() {
+                    prefix.push(i);
+                    collect_tuples(&dims[1..], prefix, out);
+                    prefix.pop();
+                }
+            }
+        }
+        let mut lt = Vec::with_capacity(total as usize);
+        let mut rt = Vec::with_capacity(total as usize);
+        collect_tuples(&ld, &mut Vec::new(), &mut lt);
+        collect_tuples(&rd, &mut Vec::new(), &mut rt);
+        let multi = |base: &Expression, idx: &[i64]| -> Expression {
+            let mut e = base.clone();
+            for &i in idx {
+                e = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(e),
+                        index: Box::new(make_udp_int_expr(i)),
+                    },
+                    Span::dummy(),
+                );
+            }
+            e
+        };
+        Some(
+            lt.into_iter()
+                .zip(rt)
+                .map(|(li, ri)| {
+                    ContinuousAssignment::with_delay(multi(lhs, &li), multi(rhs, &ri), delay)
+                })
+                .collect(),
         )
     }
 }
@@ -761,6 +1046,9 @@ pub(super) fn expanded_array_assign_parts(
     driver: &ContinuousAssignment,
     elab: &ElaboratedModule,
 ) -> Option<Vec<ContinuousAssignment>> {
+    if elab.is_bulk_array_copy_candidate(driver) {
+        return None;
+    }
     let (lhs, rhs, delay) = (driver.lhs_expr(), driver.rhs_expr(), driver.delay());
     let mut parts = elab
         .whole_array_driver_parts(&lhs, &rhs, delay, &elab.unpacked_decl_dims)
@@ -790,6 +1078,9 @@ pub(super) fn expand_whole_array_assign(
     driver: &ContinuousAssignment,
     elab: &mut ElaboratedModule,
 ) -> bool {
+    if elab.is_bulk_array_copy_candidate(driver) {
+        return false;
+    }
     match expanded_array_assign_parts(driver, elab) {
         Some(parts) => {
             elab.continuous_assigns.extend(parts);

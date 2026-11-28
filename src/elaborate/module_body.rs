@@ -9,6 +9,7 @@ pub fn elaborate_module_with_defs(
     seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
     PACKED_WIDTH_ERROR.with(|slot| slot.take());
+    let _design_ast_blob_guard = DesignAstBlobGuard::enter();
     let _oom_trace = crate::oom_trace::session();
     let _oom_definition = crate::oom_trace::definition(module, "elaborate module", module.name());
     let _top_decl_types = crate::decl_types::top_decl_types_scope();
@@ -2381,6 +2382,41 @@ pub fn elaborate_module_with_defs(
                                         }
                                         _ => (None, None),
                                     };
+                                    let is_queue = matches!(qd, UnpackedDimension::Queue { .. });
+                                    let tail = &effective_dims[split + 1..];
+                                    let tail_shape: Option<Vec<(i64, i64)>> = (!tail.is_empty()
+                                        && assoc_key.is_none()
+                                        && tail.iter().all(|d| {
+                                            matches!(
+                                                d,
+                                                UnpackedDimension::Range { .. }
+                                                    | UnpackedDimension::Expression { .. }
+                                            )
+                                        }))
+                                    .then(|| {
+                                        tail.iter()
+                                            .map(|d| {
+                                                extract_array_range(
+                                                    std::slice::from_ref(d),
+                                                    &elab.parameters,
+                                                )
+                                            })
+                                            .collect::<Option<Vec<_>>>()
+                                    })
+                                    .flatten()
+                                    .filter(|sh| {
+                                        sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                    });
+                                    let tail_decl = tail_shape.as_ref().and_then(|_| {
+                                        declared_unpacked_dims(tail, &elab.parameters)
+                                    });
+                                    let is_two_state = is_type_two_state_resolved(
+                                        &dd.data_type,
+                                        &elab.typedef_types,
+                                    );
+                                    if is_two_state {
+                                        elab.two_state_signals.insert(name.clone());
+                                    }
                                     for suffix in index_tuples(&shape) {
                                         let en = format!("{}{}", name, suffix);
                                         if let Some(f) = &elem_fields {
@@ -2400,13 +2436,57 @@ pub fn elaborate_module_with_defs(
                                             );
                                             continue;
                                         }
+                                        if is_two_state {
+                                            elab.two_state_signals.insert(en.clone());
+                                        }
                                         elab.dynamic_arrays.insert(en.clone());
+                                        if is_queue {
+                                            elab.queue_vars.insert(en.clone());
+                                        }
                                         if let Some(m) = qmax {
                                             elab.queue_max_sizes.insert(en.clone(), m);
                                         }
-                                        elab.arrays.insert(en, (0, 63, width));
+                                        if let Some(inner) = &tail_shape {
+                                            if let Some(td) = &tail_decl {
+                                                let mut all = vec![(0i64, 63i64)];
+                                                all.extend(td.iter().copied());
+                                                elab.unpacked_decl_dims.insert(en.clone(), all);
+                                            }
+                                            if inner.len() == 1 {
+                                                elab.arrays_2d
+                                                    .insert(en.clone(), ((0, 63), inner[0], width));
+                                            } else {
+                                                let mut full = vec![(0i64, 63i64)];
+                                                full.extend(inner.iter().copied());
+                                                elab.arrays_nd.insert(en.clone(), (full, width));
+                                            }
+                                            elab.var_decl_types
+                                                .insert(en.clone(), dd.data_type.clone());
+                                            if let DataType::TypeReference { name: tn, .. } =
+                                                &dd.data_type
+                                            {
+                                                elab.array_elem_class
+                                                    .insert(en, tn.name.name.clone());
+                                            }
+                                        } else {
+                                            elab.var_decl_types
+                                                .insert(en.clone(), dd.data_type.clone());
+                                            elab.arrays.insert(en, (0, 63, width));
+                                        }
                                     }
                                     elab.var_decl_types.insert(name, dd.data_type.clone());
+                                    if let Some(init_expr) = &decl.init {
+                                        elab.initial_blocks.push(InitialBlock {
+                                            stmt: Statement::new(
+                                                StatementKind::BlockingAssign {
+                                                    lvalue: make_ident_expr(&decl.name.name),
+                                                    rvalue: init_expr.as_ref().clone(),
+                                                },
+                                                Span::dummy(),
+                                            ),
+                                            scope: String::new(),
+                                        });
+                                    }
                                     continue;
                                 }
                             }
@@ -2626,6 +2706,9 @@ pub fn elaborate_module_with_defs(
                             }
                             elab.var_decl_types
                                 .insert(name.clone(), dd.data_type.clone());
+                            if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
+                                elab.two_state_signals.insert(name.clone());
+                            }
                             if let DataType::TypeReference { name: tn, .. } = &dd.data_type {
                                 elab.array_elem_class
                                     .insert(name.clone(), tn.name.name.clone());
