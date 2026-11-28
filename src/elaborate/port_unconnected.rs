@@ -87,3 +87,50 @@ pub(super) fn warn_omitted_port(
         inst_prefix.trim_end_matches('.'),
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(n: &str) -> Identifier {
+        Identifier {
+            name: n.into(),
+            span: Span::dummy(),
+        }
+    }
+
+    fn ports(names: &[&str]) -> PortList {
+        PortList::NonAnsi(names.iter().map(|n| ident(n)).collect())
+    }
+
+    fn named(n: &str) -> PortConnection {
+        PortConnection::Named {
+            name: ident(n),
+            expr: None,
+            implicit: false,
+        }
+    }
+
+    #[test]
+    fn a_short_named_list_leaves_out_the_missing_ports() {
+        let p = ports(&["i", "o", "e"]);
+        assert_eq!(omitted_ports(&p, &[named("i")]), vec!["o", "e"]);
+    }
+
+    #[test]
+    fn a_short_positional_list_leaves_out_the_trailing_ports() {
+        let p = ports(&["i", "o", "e"]);
+        assert_eq!(
+            omitted_ports(&p, &[PortConnection::Ordered(None)]),
+            vec!["o", "e"]
+        );
+    }
+
+    #[test]
+    fn full_lists_and_wildcards_leave_nothing_out() {
+        let p = ports(&["i", "o"]);
+        assert!(omitted_ports(&p, &[named("o"), named("i")]).is_empty());
+        assert!(omitted_ports(&p, &[PortConnection::Wildcard]).is_empty());
+        assert!(omitted_ports(&ports(&[]), &[]).is_empty());
+    }
+}
